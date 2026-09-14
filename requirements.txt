@@ -1,0 +1,11 @@
+# GenMusicAssist — Runtime Requirements
+# ======================================
+#
+# Install with: pip install -r requirements.txt
+# Or just read this — there's nothing here yet.
+#
+# The only hard dependency is Node.js 18+ (NOT a Python package).
+# ffmpeg is optional (for m4a/mp3 export and OS loopback capture).
+#
+# This file is a placeholder for future Python dependencies.
+# The app currently runs entirely on Node.js + browser extension.

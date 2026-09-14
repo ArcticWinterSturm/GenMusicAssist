@@ -1,0 +1,22 @@
+{
+  "name": "genmusicassist",
+  "version": "1.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Volume-invariant capture + curation for Suno — saves what you hear, normalizes loudness, files the best takes.",
+  "license": "GPL-3.0-or-later",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node desktop/cli.js serve",
+    "serve": "node desktop/cli.js serve",
+    "status": "node desktop/cli.js status",
+    "report": "node desktop/cli.js report",
+    "auto": "node desktop/cli.js auto --watch",
+    "auto-once": "node desktop/cli.js auto --once"
+  },
+  "bin": {
+    "genmusicassist": "desktop/cli.js"
+  }
+}

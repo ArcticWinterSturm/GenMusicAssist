@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "GenMusicAssist — Suno Capture & Curation Studio",
+  "version": "1.0.1",
+  "minimum_chrome_version": "114",
+  "description": "Volume-invariant capture of what Suno is playing, with per-segment listen metadata, curation scoring, and quota-safe export.",
+  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "action": {
+    "default_title": "GenMusicAssist — capture / curation",
+    "default_icon": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+  },
+  "background": { "service_worker": "background.js" },
+  "side_panel": { "default_path": "sidepanel/sidepanel.html" },
+  "options_ui": { "page": "sidepanel/sidepanel.html#settings", "open_in_tab": true },
+  "permissions": [
+    "storage",
+    "downloads",
+    "cookies",
+    "notifications",
+    "alarms",
+    "sidePanel",
+    "offscreen",
+    "declarativeNetRequestWithHostAccess"
+  ],
+  "host_permissions": [
+    "https://suno.com/*",
+    "https://*.suno.com/*",
+    "https://*.suno.ai/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://suno.com/*"],
+      "js": ["lib/sunolift-bundle.js", "content/tap.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://suno.com/*"],
+      "js": ["lib/sunolift-bundle.js", "content/bridge.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["lib/sunolift-bundle.js", "content/pcm-worklet.js", "icons/*.png"],
+      "matches": ["https://suno.com/*"]
+    }
+  ],
+  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'none'" }
+}

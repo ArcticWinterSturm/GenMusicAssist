@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GenMusicAssist — review</title>
+<style>
+:root{
+  --bg:#07080d; --glass:rgba(18,22,34,.55); --glass2:rgba(26,32,48,.42);
+  --edge:rgba(255,255,255,.09); --edge2:rgba(255,255,255,.16);
+  --t:#eef2fa; --d:#93a1bd; --ok:#4ade80; --w:#fbbf24; --b:#fb7185; --a:#a78bfa; --bl:#60a5fa;
+  --glow:0 8px 32px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.06);
+}
+*{box-sizing:border-box}
+body{margin:0;color:var(--t);font:13px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  background:
+    radial-gradient(1100px 500px at 12% -8%, rgba(99,102,241,.16), transparent 60%),
+    radial-gradient(900px 480px at 88% -4%, rgba(236,72,153,.10), transparent 55%),
+    radial-gradient(800px 600px at 50% 115%, rgba(56,189,248,.08), transparent 60%),
+    var(--bg);
+  background-attachment:fixed; min-height:100vh}
+header{position:sticky;top:0;z-index:9;padding:12px 18px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+  background:linear-gradient(180deg, rgba(10,12,18,.78), rgba(10,12,18,.55));
+  backdrop-filter:blur(18px) saturate(1.3); -webkit-backdrop-filter:blur(18px) saturate(1.3);
+  border-bottom:1px solid var(--edge); box-shadow:0 6px 24px rgba(0,0,0,.35)}
+h1{font-size:14px;margin:0;font-weight:680;letter-spacing:.4px;
+  background:linear-gradient(90deg,#e8ecf7,#b9c4e8 60%,#8f9fd6);-webkit-background-clip:text;background-clip:text;color:transparent}
+main{padding:16px 18px 90px;max-width:1180px}
+button,select,input{font:inherit;color:var(--t);background:var(--glass);border:1px solid var(--edge);
+  border-radius:10px;padding:6px 11px;cursor:pointer;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  transition:background .15s,border-color .15s,box-shadow .15s}
+button:hover,select:hover{background:var(--glass2);border-color:var(--edge2);box-shadow:0 2px 14px rgba(0,0,0,.3)}
+button:disabled{opacity:.4;cursor:default;box-shadow:none}
+.pri{background:linear-gradient(135deg,rgba(139,124,246,.28),rgba(96,165,250,.18));border-color:rgba(167,139,250,.45)}
+.pri:hover{border-color:rgba(167,139,250,.7)}
+.dz{background:linear-gradient(135deg,rgba(251,113,133,.22),rgba(190,24,93,.14));border-color:rgba(251,113,133,.4)}
+.on{border-color:var(--ok);color:var(--ok);box-shadow:0 0 14px rgba(74,222,128,.18)}
+.pill{border:1px solid var(--edge);border-radius:999px;padding:2px 10px;font-size:11px;color:var(--d);white-space:nowrap;
+  background:var(--glass);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+.pill.ok{color:var(--ok);border-color:rgba(74,222,128,.4);background:rgba(20,60,40,.35)}
+.pill.w{color:var(--w);border-color:rgba(251,191,36,.4);background:rgba(70,50,8,.3)}
+.pill.b{color:var(--b);border-color:rgba(251,113,133,.4);background:rgba(70,16,28,.3)}
+.pills{display:flex;gap:5px;flex-wrap:wrap}
+.card{background:var(--glass);border:1px solid var(--edge);border-radius:16px;padding:13px 15px;margin-bottom:12px;
+  backdrop-filter:blur(16px) saturate(1.25);-webkit-backdrop-filter:blur(16px) saturate(1.25);
+  box-shadow:var(--glow);transition:border-color .2s,transform .2s}
+.card:hover{border-color:var(--edge2)}
+.grid{display:grid;grid-template-columns:56px 1fr 200px 150px;gap:12px;align-items:center}
+.score{text-align:center;font-size:23px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}
+.score small{display:block;font-size:9.5px;font-weight:500;letter-spacing:.7px;text-transform:uppercase;color:var(--d);margin-top:3px}
+.t{font-weight:600;font-size:13.5px}
+.m{color:var(--d);font-size:11.5px;font-variant-numeric:tabular-nums}
+canvas{display:block;width:100%;height:38px;background:rgba(8,10,16,.6);border:1px solid var(--edge);border-radius:8px;margin:5px 0}
+.cov{height:7px;border-radius:4px;background:rgba(255,255,255,.06);overflow:hidden;display:flex}
+.cov i{display:block;height:100%;background:linear-gradient(90deg,var(--ok),var(--bl));box-shadow:0 0 8px rgba(96,165,250,.35)}
+.acts{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+.acts button{padding:5px 6px;font-size:11.5px}
+.bar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+input[type=text]{width:210px;cursor:text}
+input::placeholder{color:rgba(147,161,189,.55)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:1px 9px;font-size:11.5px;color:var(--d)}
+.kv b{font-weight:500}
+.kv span{color:var(--t);font-variant-numeric:tabular-nums;word-break:break-all}
+.seg{display:grid;grid-template-columns:46px 1fr 40px;gap:6px;align-items:center;font-size:10.5px;padding:1.5px 0}
+.seg .b{height:5px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden}
+.seg .b i{display:block;height:100%;background:linear-gradient(90deg,var(--ok),var(--bl))}
+details summary{cursor:pointer;color:var(--d);font-size:11.5px}
+details summary:hover{color:var(--t)}
+.empty{text-align:center;color:var(--d);padding:48px 12px;
+  background:var(--glass);border:1px dashed var(--edge);border-radius:16px;backdrop-filter:blur(12px)}
+#toast{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);background:rgba(18,22,34,.85);
+  backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border:1px solid var(--edge2);border-left:3px solid var(--bl);
+  padding:9px 15px;border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.5);display:none;z-index:20;color:var(--t)}
+#toast.e{border-left-color:var(--b)}#toast.o{border-left-color:var(--ok)}
+audio{width:100%;height:32px;margin-top:5px;filter:invert(.92) hue-rotate(180deg);border-radius:8px}
+kbd{border:1px solid var(--edge);border-bottom-width:2px;border-radius:5px;padding:0 4px;font-size:10px;background:rgba(255,255,255,.05)}
+</style>
+</head>
+<body>
+<header>
+  <h1>GenMusicAssist · review</h1>
+  <span id="hb" class="pill">…</span>
+  <span id="hap" class="pill">autopilot …</span>
+  <span id="hq" class="pill">quota —</span>
+  <span id="hs" class="pill">—</span>
+  <span style="flex:1"></span>
+  <button id="ap" class="pri" title="run the curation pass now">⚡ Curate now</button>
+  <button id="rfl">◉ Reflect capture</button>
+  <button id="stop" disabled class="dz">■ Stop</button>
+  <button id="rl">↻</button>
+</header>
+<main>
+  <div class="bar">
+    <select id="mode">
+      <option value="triage">Triage (unjudged)</option>
+      <option value="all">All captures</option>
+      <option value="keep">Kept</option>
+      <option value="recapture">Needs recapture</option>
+      <option value="keeps">Keeps (ready to use)</option>
+      <option value="clips">By clip</option>
+    </select>
+    <select id="sort"><option value="score">best first</option><option value="recent">newest</option><option value="accrued">most listened</option><option value="coverage">coverage</option></select>
+    <input type="text" id="q" placeholder="filter title, tag, clip id…">
+    <span class="m" id="cnt"></span>
+    <span style="flex:1"></span>
+    <span class="m"><kbd>k</kbd> keep <kbd>j</kbd> drop <kbd>p</kbd> process <kbd>space</kbd> play</span>
+  </div>
+  <div id="list"></div>
+</main>
+<div id="toast"></div>
+<script>
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt=s=>s==null||!isFinite(s)?'—':`${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+const R='http://'+location.host;
+const S={recs:[],clips:[],sel:null,sort:'score',mode:'triage',q:'',playing:null,rfl:null};
+const toast=(m,k='')=>{const t=$('#toast');t.textContent=m;t.className=k;t.style.display='block';clearTimeout(t.x);t.x=setTimeout(()=>t.style.display='none',3400)};
+const api=async(p,o)=>{const r=await fetch(R+p,o);const j=await r.json().catch(()=>({}));if(!r.ok)throw Object.assign(new Error(j.error||('HTTP '+r.status)),{body:j});return j};
+const post=(p,b)=>api(p,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b||{})});
+
+async function boot(){
+  try{
+    const ping=await api('/ping');
+    $('#hb').textContent=`app v${ping.version}`; $('#hb').className='pill '+(ping.ffmpeg?'ok':'w');
+    $('#hb').title=`ffmpeg: ${ping.ffmpeg?'found':'missing (WAV+metadata only)'}\nbackends: ${(ping.backends||[]).join(', ')||'none'}\nroot: ${ping.root}`;
+    $('#hs').textContent=`${ping.stats.captures} captures · ${ping.stats.clips} clips · ${ping.stats.mb} MB`;
+    if(ping.reflect_active){S.rfl=true;paintRfl()}
+  }catch(e){$('#hb').textContent='app offline';$('#hb').className='pill b';$('#hb').title=String(e)}
+  try{const q=await api('/quota');$('#hq').textContent=`quota ${q.remaining??'?'} left`;$('#hq').className='pill '+((q.remaining??0)>0?'ok':'b');$('#hq').title=`Suno MP3/WAV downloads. ${q.policy_note||''}`}
+  catch(e){$('#hq').textContent='quota n/a';$('#hq').title=String(e.message)}
+  await load();
+  await loadAutopilot();
+}
+async function load(){
+  try{const d=await api('/library');S.recs=d.records||[];S.clips=d.clips||[];render()}
+  catch(e){$('#list').innerHTML=`<div class="empty">could not read the library: ${esc(e.message)}</div>`}
+}
+async function loadAutopilot(){
+  try{
+    const a=await api('/autopilot');
+    S.ap=a;
+    const st=a.stats||{};
+    $('#hap').textContent=a.running?`autopilot on · ${st.promoted||0} kept`:'autopilot off';
+    $('#hap').className='pill '+(a.running?'ok':'w');
+    $('#hap').title=[
+      `keeps folder: ${a.keeps_folder}`,
+      `runs: ${st.runs||0} · processed: ${st.processed||0} · kept: ${st.promoted||0} · quarantined: ${st.quarantined||0}`,
+      `target: ${a.config?.target_lufs} LUFS · keep score ≥ ${a.config?.keep_score}`,
+      st.last_run?`last pass: ${st.last_run}`:'no pass yet',
+      a.ffmpeg?'ffmpeg: yes (m4a export available)':'ffmpeg: missing (WAV only)',
+      a.last_error?`last error: ${a.last_error}`:'',
+    ].filter(Boolean).join('\n');
+  }catch(e){$('#hap').textContent='autopilot n/a';$('#hap').className='pill b';$('#hap').title=String(e.message)}
+}
+const rows=()=>{
+  let r = S.mode==='clips'?S.clips.map(c=>({...c,capture_id:c.best?.capture_id,listen_state:c.best?.listen_state,audio:c.best?.audio,song:c.song,curation:c.best?.curation,files:c.best?.files,takes:c.takes}))
+    : S.recs.slice();
+  if(S.mode==='triage') r=r.filter(x=>!x.curation?.verdict||x.curation.verdict==='unjudged');
+  if(S.mode==='keep') r=r.filter(x=>x.curation?.verdict==='keep');
+  if(S.mode==='keeps') r=r.filter(x=>x.curation?.verdict==='keep').sort((a,b)=>String(a.song?.title||'').localeCompare(String(b.song?.title||'')));
+  if(S.mode==='recapture') r=r.filter(x=>x.curation?.verdict==='recapture'||x.audio?.had_zero_gain||x.audio?.usable===false);
+  const q=S.q.toLowerCase();
+  if(q) r=r.filter(x=>[x.song?.title,x.song?.style_tags,x.clip_id,x.capture_id].some(v=>String(v||'').toLowerCase().includes(q)));
+  const k=S.sort;
+  r.sort((a,b)=>k==='recent'?String(b.created_at).localeCompare(String(a.created_at)):k==='accrued'?(b.listen_state?.accrued_seconds||0)-(a.listen_state?.accrued_seconds||0):k==='coverage'?(b.listen_state?.coverage||0)-(a.listen_state?.coverage||0):(b.curation?.score||0)-(a.curation?.score||0));
+  return r;
+};
+function render(){
+  const r=rows(); $('#cnt').textContent=`${r.length} shown`;
+  $('#list').innerHTML=r.length?r.map(row).join(''):`<div class="empty">Nothing here.<br><span class="m">Play a song on suno.com with the extension enabled — takes land here automatically.</span></div>`;
+  r.forEach(x=>{drawW(x);wire(x)});
+}
+function row(x){
+  const l=x.listen_state||{},a=x.audio||{},c=x.curation||{},dur=x.song?.duration_s||a.duration_s||1;
+  const cov=Math.round((l.coverage||0)*100), mile=['5s','30s','60s','completed'].map(m=>`<span class="pill ${((l.milestones||[]).includes(m)||(m==='completed'&&l.completed))?'ok':''}">${m}</span>`).join('');
+  const f=[];
+  if(x.media?.audio_url_is_sentinel)f.push('<span class="pill w">audio_url = /api/forbidden</span>');
+  if(a.had_zero_gain)f.push('<span class="pill b">0% volume take</span>');
+  if(a.usable===false)f.push('<span class="pill b">unusable</span>');
+  if(a.measured_lufs_after!=null)f.push(`<span class="pill ok">${(+a.measured_lufs_after).toFixed(1)} LUFS</span>`);
+  if(a.applied_gain_db!=null&&Math.abs(a.applied_gain_db)>0.05)f.push(`<span class="pill ok">+${(+a.applied_gain_db).toFixed(1)} dB de-attenuation</span>`);
+  if(a.gap_count||a.gaps)f.push(`<span class="pill w">${a.gaps||a.gap_count} pcm gaps</span>`);
+  if(x.archive_urgency!=null&&x.archive_urgency<10)f.push(`<span class="pill ${x.archive_urgency<3?'b':'w'}">suno copy expires ~${x.archive_urgency}d</span>`);
+  if(x.takes>1)f.push(`<span class="pill">${x.takes} takes</span>`);
+  const sc=c.score??'—',col=sc>=70?'var(--ok)':sc>=40?'var(--w)':'var(--b)';
+  return `<div class="card" data-id="${esc(x.capture_id)}">
+  <div class="grid">
+    <div class="score" style="color:${col}">${sc}<small>${esc(c.verdict||'unjudged')}</small></div>
+    <div>
+      <div class="t">${esc(x.song?.title||'(untitled generation)')}</div>
+      <div class="m">heard ${fmt(l.accrued_seconds)} of ${fmt(dur)} · ${cov}% of the song · ${((a.bytes||0)/1048576).toFixed(1)} MB${a.bitrate_kbps?` · ${a.bitrate_kbps} kbps`:''} · ${esc((x.song?.major_model_version||'')+' '+(x.song?.model_name||''))}</div>
+      <canvas data-w="${esc(x.capture_id)}" width="1100" height="76"></canvas>
+      <div class="cov" title="heard spans"><i style="width:${cov}%"></i></div>
+      <div class="pills" style="margin-top:6px">${mile}${f.join('')}</div>
+      <details style="margin-top:6px"><summary>segments, cues, raw metadata</summary>
+        <div id="s-${esc(x.capture_id)}">${(x.segments||[]).length?x.segments.map(g=>`<div class="seg"><span class="m">${fmt(g.start)}</span><span class="b"><i style="width:${Math.round((g.heard_ratio||0)*100)}%"></i></span><span class="m">${Math.round((g.heard_ratio||0)*100)}%</span></div>`).join(''):'<div class="m">no segment map yet — press Structure.</div>'}</div>
+        <div class="kv" style="margin-top:7px">
+          <b>clip_id</b><span>${esc(x.clip_id)}</span>
+          <b>capture</b><span>${esc(x.capture_id)}</span>
+          <b>spans</b><span>${(l.covered_intervals||[]).map(i=>`${fmt(i.start)}–${fmt(i.end)}`).join(', ')||'—'}</span>
+          <b>replays</b><span>${l.replay_count||0} · skips ${(l.seek_events||[]).filter(e=>e.kind==='skip').length} · max rate ${l.max_playback_rate||1}</span>
+          <b>captured</b><span>${esc(x.created_at)} via ${esc(a.source)}</span>
+          <b>media_urls</b><span>${(x.media?.media_urls||[]).map(m=>`${m.content_type}/${m.delivery}${m.encoding?' enc:'+m.encoding:''}`).join(' | ')||'—'}</span>
+          <b>audio</b><span>${esc(a.container)}/${esc(a.codec)} ${esc(a.sample_rate)}Hz ${esc(a.channels)}ch · target ${esc(a.target_lufs)} LUFS</span>
+          <b>style</b><span>${esc((x.song?.style_tags||'').slice(0,300))}</span>
+        </div>
+      </details>
+    </div>
+    <div>
+      ${x.files?.audio||a.normalized_wav?`<audio controls preload="none" src="${esc((a.normalized_wav?'/files?path='+encodeURIComponent(a.normalized_wav):'/files?path='+encodeURIComponent(x.files.audio)))}#t=0"></audio>`:'<div class="m">audio not on the app — it stayed in the browser (enable “also save a copy” or press Pull)</div>'}
+      <div class="m" style="margin-top:4px">player starts at 0:00; green on the bar = you actually heard it</div>
+    </div>
+    <div class="acts">
+      <button data-a="keep" class="pri">★ Keep</button><button data-a="drop" class="dz">✕ Drop</button>
+      <button data-a="process">⚙ Process</button><button data-a="export">⇩ m4a</button>
+      <button data-a="struct">Structure</button><button data-a="side">Sidecars</button>
+      <button data-a="where" title="where the files live">📍 Where</button>
+    </div>
+  </div></div>`;
+}
+function drawW(x){
+  const c=document.querySelector(`canvas[data-w="${CSS.escape(x.capture_id)}"]`); if(!c)return;
+  const g=c.getContext('2d'),W=c.width,H=c.height,dur=x.song?.duration_s||x.audio?.duration_s||1;
+  g.fillStyle='#080a10';g.fillRect(0,0,W,H);
+  const peaks=x.waveform?.peaks;
+  const n=peaks?.length||220;
+  for(let i=0;i<n;i++){
+    const t=i/n*W;
+    let hi,lo;
+    if(peaks){[hi,lo]=peaks[i]}
+    else{const tt=i/n;hi=.12+.5*Math.abs(Math.sin(tt*24)*Math.cos(tt*7.1));lo=-hi}
+    g.fillStyle=peaks?'rgba(122,140,180,.75)':'rgba(255,255,255,.06)';
+    g.fillRect(t,H/2-hi*H/2,Math.max(1,W/n-1),Math.max(1,(hi-lo)*H/2));
+  }
+  g.fillStyle='rgba(74,222,128,.25)';
+  for(const s of (x.listen_state?.covered_intervals||[])) g.fillRect(s.start/dur*W,0,Math.max(1,(s.end-s.start)/dur*W),H);
+  g.strokeStyle='rgba(167,139,250,.8)';g.lineWidth=1;g.beginPath();g.moveTo(0,H-1);g.lineTo(W,H-1);g.stroke();
+}
+function wire(x){
+  const root=document.querySelector(`[data-id="${CSS.escape(x.capture_id)}"]`); if(!root)return;
+  root.querySelectorAll('button[data-a]').forEach(b=>b.onclick=async()=>{
+    const a=b.dataset.a;b.disabled=true;
+    try{
+      // 'drop' is not a verdict the server knows: the allow-list is
+      // keep|maybe|discard|recapture|skip-unheard, so every Drop click and the
+      // `j` key were answered with a 400.
+      if(a==='keep'||a==='drop'){await post('/triage',{capture_id:x.capture_id,verdict:a==='keep'?'keep':'discard'});toast(a==='keep'?'kept':'dropped','o');await load();await loadAutopilot()}
+      else if(a==='process'){const r=await post('/capture/process',{capture_id:x.capture_id,formats:['m4a']});toast(`processed: ${r.result.measured_lufs_before}→${r.result.measured_lufs_after} LUFS, +${r.result.applied_gain_db} dB de-attenuation`,'o');await load();await loadAutopilot()}
+      else if(a==='export'){const s=await post('/export/official',{clip_ids:[x.clip_id],format:'m4a'});toast(s.ok?`wrote ${s.file} (${(s.bytes/1048576).toFixed(1)} MB, no quota used)`:'export failed','o')}
+      else if(a==='struct'){const r=await api('/structure?clip_id='+encodeURIComponent(x.clip_id));x.segments=r.sections?.length?segFrom(r,x):null;toast(`${(r.waveform?.waveform_aggregates||[]).length} waveform levels, ${(r.sections||[]).length} sections, ${(r.downbeats||[]).length} downbeats`,'o');render()}
+      else if(a==='where'){
+        const f=x.files||{},w=x.files?.kept||x.audio?.normalized_wav||x.files?.quarantined||x.files?.audio||'(nothing on disk yet)';
+        toast(`file: ${w}`,'o');console.log('GenMusicAssist file map',{capture_id:x.capture_id,files:f,normalized:x.audio?.normalized_wav});
+      }
+      else if(a==='side'){const t=await api('/sidecars?capture_id='+encodeURIComponent(x.capture_id));const w=open('','_blank');w.document.write(`<title>sidecars</title><body style="background:#07080d;color:#eef2fa;font:12px/1.6 ui-monospace,monospace;padding:20px"><h3>txt</h3><pre>${esc(t.txt||'—')}</pre><h3>cue</h3><pre>${esc(t.cue||'—')}</pre>`);w.document.close()}
+    }catch(e){toast(String(e.message||e),'e')}
+    b.disabled=false;
+  });
+}
+function segFrom(r,x){
+  const dur=x.song?.duration_s||0,cov=x.listen_state?.covered_intervals||[];
+  const b=new Set([0,dur]);(r.sections||[]).forEach(s=>{b.add(s.start_time??s.start);b.add(s.end_time??s.end)});
+  const t=[...b].filter(v=>isFinite(v)&&v>=0).sort((p,q)=>p-q),out=[];
+  for(let i=0;i<t.length-1;i++){const s=t[i],e=t[i+1];if(e-s<.2)continue;
+    const h=cov.reduce((a,c)=>a+Math.max(0,Math.min(e,c.end)-Math.max(s,c.start)),0);
+    out.push({start:s,end:e,heard_ratio:dur?h/(e-s):0,label:(r.sections||[])[i]?.label||`seg${i}`})}
+  return out;
+}
+$('#mode').onchange=e=>{S.mode=e.target.value;render()};
+$('#sort').onchange=e=>{S.sort=e.target.value;render()};
+$('#q').oninput=e=>{S.q=e.target.value;render()};
+$('#rl').onclick=async()=>{await load();toast('reloaded','o')};
+$('#ap').onclick=async()=>{
+  const b=$('#ap');b.disabled=true;b.textContent='⚡ curating…';
+  try{
+    const r=await post('/autopilot/once',{});
+    const p=r.result||{};
+    toast(`curated ${p.processed?.length||0} take(s) — ${p.kept||0} kept, ${p.quarantined?.length||0} quarantined`,'o');
+    await load();await loadAutopilot();
+  }catch(e){toast(String(e.message||e),'e')}
+  b.disabled=false;b.textContent='⚡ Curate now';
+};
+$('#rfl').onclick=async()=>{try{const r=await post('/reflect/start',{capture_id:'reflect-ui-'+Date.now().toString(36)});S.rfl=r;paintRfl();toast(`reflect: ${r.backend} on ${r.device||'default'}`,'o')}catch(e){toast(String(e.message),'e')}};
+$('#stop').onclick=async()=>{try{const r=await post('/reflect/stop',{});S.rfl=null;paintRfl();toast(`saved ${r.capture?.capture_id} · ${r.processing?.duration_s}s @ ${r.processing?.measured_lufs_after} LUFS`,'o');await load()}catch(e){toast(String(e.message),'e')}};
+function paintRfl(){$('#rfl').disabled=!!S.rfl;$('#stop').disabled=!S.rfl;$('#rfl').className=S.rfl?'on':''}
+addEventListener('keydown',e=>{
+  if(/INPUT|TEXTAREA|SELECT/.test(e.target.tagName))return;
+  const first=rows()[0]; if(!first)return; S.sel=S.sel||first.capture_id;
+  if(e.key==='k'){post('/triage',{capture_id:first.capture_id,verdict:'keep'}).then(load);e.preventDefault()}
+  if(e.key==='j'){post('/triage',{capture_id:first.capture_id,verdict:'discard'}).then(()=>{load();loadAutopilot()});e.preventDefault()}
+  if(e.key==='p'){post('/capture/process',{capture_id:first.capture_id,formats:[]}).then(r=>{toast(`+${r.result.applied_gain_db} dB, ${r.result.measured_lufs_after} LUFS`,'o');load()});e.preventDefault()}
+});
+boot();
+setInterval(()=>{if(document.visibilityState==='visible'&&!S.rfl){load().catch(()=>{});loadAutopilot().catch(()=>{})}},15000);
+</script>
+</body>
+</html>
