@@ -32,11 +32,13 @@
  *     "MILESTONE_THRESHOLDS",
  *     "SCHEMA_VERSION",
  *     "buildSegmentMap",
+ *     "captureStartGate",
  *     "isForbiddenMediaUrl",
  *     "lastHeardThrough",
  *     "makeCaptureRecord",
  *     "mergeIntervals",
  *     "reachesEnd",
+ *     "shouldRolloverCapture",
  *     "sidecarCue",
  *     "sidecarJson",
  *     "sidecarRows",
@@ -592,6 +594,41 @@ function __sunolift_metadata_js() {
 const fmt = fmtClock;
 
 const SCHEMA_VERSION = 'sunolift.capture/1';
+
+/**
+ * A different UUID from the player/network is a definitive track transition.
+ * Deliberately accepts no duration: generated songs often have equal or nearly
+ * equal lengths, so duration is corroborating telemetry, never identity.
+ */
+function shouldRolloverCapture(currentId, candidateId, source) {
+  const strong = source === 'network' || String(source || '').startsWith('active-');
+  return Boolean(strong && currentId && candidateId && currentId !== candidateId);
+}
+
+/** Block the transient 0:00/0:00 MSE handoff between adjacent Suno songs. */
+function captureStartGate({
+  duration,
+  currentTime = 0,
+  readyState = 0,
+  ended = false,
+  clipId = null,
+  networkClipId = null,
+  networkState = null,
+  networkAgeMs = Infinity,
+  identityPending = false,
+} = {}) {
+  const d = Number(duration);
+  if (!Number.isFinite(d) || d <= 0) return { ok: false, reason: 'duration-unavailable' };
+  if (Number(readyState) < 3) return { ok: false, reason: 'media-not-ready' };
+  if (ended && d - Number(currentTime || 0) < 3) return { ok: false, reason: 'media-ended' };
+  const freshQueueState = networkClipId && Number(networkAgeMs) < 10000;
+  const atStart = !Number.isFinite(Number(currentTime)) || Number(currentTime) <= 0.25;
+  if (atStart && identityPending) return { ok: false, reason: 'identity-pending' };
+  if (freshQueueState && atStart && networkState && networkState !== 'playing') {
+    return { ok: false, reason: `playbar-${networkState}` };
+  }
+  return { ok: true, reason: 'ready' };
+}
 const MILESTONE_THRESHOLDS = [
   { threshold: 5, milestone: '5s', actionName: 'SongPlayed5s' },
   { threshold: 30, milestone: '30s', actionName: 'SongPlayed30s' },
@@ -992,9 +1029,9 @@ function sidecarTxt(rec) {
   return lines.join('\n') + '\n';
 }
 
-function sidecarCue(rec) {
+function sidecarCue(rec, audioFilename = null) {
   const title = (rec.song?.title || 'Untitled').replace(/"/g, "'");
-  const file = `${title}.${rec.audio?.container || 'webm'}`;
+  const file = String(audioFilename || `${title}.${rec.audio?.container || 'webm'}`).replace(/"/g, "'");
   const out = [`PERFORMER "Suno AI"`, `TITLE "${title}"`, `REM SUNO_CLIP_ID ${rec.clip_id || ''}`, `REM CAPTURE_ID ${rec.capture_id || ''}`, `REM LISTEN_ACCRUED ${rec.listen_state?.accrued_seconds ?? 0}`, `REM COVERAGE ${rec.listen_state?.coverage ?? 0}`, `FILE "${file}" WAVE`];
   (rec.segments || []).forEach((g, i) => out.push(`  TRACK ${String(i + 1).padStart(2, '0')} AUDIO`, `    TITLE "${g.label} ${fmt(g.start)}-${fmt(g.end)}"`, `    INDEX 01 ${mmssCue(g.start)}`));
   if (!out.length) out.push('  TRACK 01 AUDIO', '    INDEX 01 00:00:00');
@@ -1021,7 +1058,7 @@ function mmssCue(sec) {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}:${String(f).padStart(2, '0')}`;
 }
 
-return { DEFAULT_WEIGHTS, ListenAccumulator, MAX_CONTIGUOUS_DELTA, MILESTONE_THRESHOLDS, SCHEMA_VERSION, buildSegmentMap, isForbiddenMediaUrl, lastHeardThrough, makeCaptureRecord, mergeIntervals, reachesEnd, sidecarCue, sidecarJson, sidecarRows, sidecarTxt, triageScore };
+return { DEFAULT_WEIGHTS, ListenAccumulator, MAX_CONTIGUOUS_DELTA, MILESTONE_THRESHOLDS, SCHEMA_VERSION, buildSegmentMap, captureStartGate, isForbiddenMediaUrl, lastHeardThrough, makeCaptureRecord, mergeIntervals, reachesEnd, shouldRolloverCapture, sidecarCue, sidecarJson, sidecarRows, sidecarTxt, triageScore };
 }
 
 function __sunolift_suno_api_js() {

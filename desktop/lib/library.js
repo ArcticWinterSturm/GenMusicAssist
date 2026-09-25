@@ -59,7 +59,7 @@ export class Library {
     const jsonPath = this.pathFor(rec.capture_id, 'json');
     writeFileSync(jsonPath, sidecarJson(rec));
     writeFileSync(this.pathFor(rec.capture_id, 'txt'), sidecarTxt(rec));
-    writeFileSync(this.pathFor(rec.capture_id, 'cue'), sidecarCue(rec));
+    writeFileSync(this.pathFor(rec.capture_id, 'cue'), sidecarCue(rec, basename(audioPath)));
     rec.files = {
       ...(rec.files || {}),
       audio: rec.files?.audio || (existsSync(audioPath) ? audioPath : null),
@@ -128,7 +128,10 @@ export class Library {
   _writeSidecars(rec) {
     try { writeFileSync(this.pathFor(rec.capture_id, 'json'), sidecarJson(rec)); } catch { /* disk full / locked */ }
     try { writeFileSync(this.pathFor(rec.capture_id, 'txt'), sidecarTxt(rec)); } catch { /* ok */ }
-    try { writeFileSync(this.pathFor(rec.capture_id, 'cue'), sidecarCue(rec)); } catch { /* ok */ }
+    try {
+      const audio = rec.files?.audio ? basename(rec.files.audio) : basename(this.audioPath(rec.capture_id, rec.audio?.container || 'webm'));
+      writeFileSync(this.pathFor(rec.capture_id, 'cue'), sidecarCue(rec, audio));
+    } catch { /* ok */ }
   }
 
   pathFor(captureId, ext) { return join(this.dir, `${basename(String(captureId).replace(/[^\w.-]/g, '_'))}.${ext}`); }

@@ -13,11 +13,12 @@
  * extension service worker or the user's own browser tab on localhost.
  */
 import { createServer } from 'node:http';
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, unlinkSync, renameSync } from 'node:fs';
 import { join, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
+import { spawn } from 'node:child_process';
 import { Library } from './lib/library.js';
 import { processTake, convertTo, writeWavMetadataTag, readWavMetadataTag } from './lib/encode.js';
 import { probe, ReflectCapture } from './lib/reflect.js';
@@ -26,7 +27,7 @@ import { encodeWav, measureLoudness, round, peakLinear } from '../shared/dsp.js'
 import { makeCaptureRecord, triageScore, SCHEMA_VERSION } from '../shared/metadata.js';
 import { API_PROD, parseDownloadQuota } from '../shared/suno-api.js';
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.0.5';
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.wav': 'audio/wav', '.webm': 'audio/webm', '.txt': 'text/plain; charset=utf-8', '.cue': 'text/plain; charset=utf-8', '.png': 'image/png' };
 
@@ -54,6 +55,40 @@ export async function createApp({ root, port = 8787, host = '127.0.0.1', quiet =
     req.on('error', rej);
   });
   const readJson = async (req) => { const b = await readBody(req); if (!b.length) return {}; try { return JSON.parse(b.toString('utf8')); } catch (e) { throw Object.assign(new Error('invalid JSON body'), { cause: e }); } };
+
+  /**
+   * MediaRecorder muxes WebM live, sequentially — no Duration element, no Cues
+   * (seek index), every cluster sized "unknown". The file is a live stream in a
+   * file container: Chrome's <audio> plays it fine, but VLC and ffprobe see
+   * duration=0 and seeking is impossible. ffmpeg exit 3199971767
+   * ("EBML header parsing failed") on every one of these.
+   *
+   * Fix: stream-copy remux through ffmpeg, which writes a real Duration, Cues,
+   * and closes cluster sizes. No re-encode, no quality loss, ~1 s for a 4 MB file.
+   *
+   * Failure is non-fatal — the original file stays on disk (still playable in
+   * Chrome), and we return so the capture isn't blocked by a fix that can only
+   * help.
+   */
+  async function remuxWebm(file) {
+    if (!/\.webm$/i.test(file)) return;
+    if (!tools.tools.ffmpeg) return;
+    const tmp = `${file}.remuxing.webm`;
+    try {
+      await new Promise((res, rej) => {
+        const p = spawn(tools.tools.ffmpeg, ['-y', '-v', 'error', '-i', file, '-c', 'copy', tmp]);
+        let err = '';
+        p.stderr.on('data', (d) => { err = (err + d).slice(-2000); });
+        p.on('error', rej);
+        p.on('exit', (c) => c === 0 ? res() : rej(new Error(`ffmpeg remux exit ${c}: ${err}`)));
+      });
+      renameSync(tmp, file);
+      log('remuxed webm:', file);
+    } catch (e) {
+      log('remux failed (keeping original):', e.message);
+      try { unlinkSync(tmp); } catch { /* best effort */ }
+    }
+  }
 
   async function sunoFetch(path, { method = 'GET', body } = {}) {
     const cookie = lib.cookieHeader();
@@ -108,6 +143,10 @@ export async function createApp({ root, port = 8787, host = '127.0.0.1', quiet =
       const entry = pcm.get(id) || {};
       entry.file = file; entry.bytes = buf.length; entry.hash = hash; entry.ext = ext;
       pcm.set(id, entry);
+      // MediaRecorder produces a "live" WebM — no Duration, no Cues — that breaks
+      // VLC/ffprobe. Remux asynchronously so the extension gets its ACK without
+      // waiting for ffmpeg; on failure the original stays on disk still playable.
+      if (ext === 'webm') remuxWebm(file).catch(() => {});
       return json(res, 200, { ok: true, file, bytes: buf.length, sha256: hash });
     },
 
@@ -213,7 +252,12 @@ export async function createApp({ root, port = 8787, host = '127.0.0.1', quiet =
       const body = await readJson(req);
       const id = body.capture_id || body.captureId;
       const s = pcm.get(id) || {};
-      const rec = buildRecord(id, body.meta || body, {
+      // /capture/meta may contain richer canonical metadata than the final
+      // transport message. Merge it, but let explicit final fields win.
+      const stored = s.meta || {};
+      const incoming = body.meta || body;
+      const merged = { ...stored, ...incoming, clip: incoming.clip || stored.clip || null };
+      const rec = buildRecord(id, merged, {
         bytes: body.bytes || s.bytes || 0, mime: body.mime || 'audio/webm;codecs=opus',
         container: s.ext || 'webm', codec: 'opus', sample_rate: body.sample_rate || 48000, channels: 2,
         duration_s: (body.durationMs || 0) / 1000 || 0,
@@ -468,10 +512,36 @@ export async function createApp({ root, port = 8787, host = '127.0.0.1', quiet =
   function bytes200(path, type) { return { __raw: true, file: path, type }; }
 
   function buildRecord(captureId, meta, audio) {
-    const clip = meta.clip || {};
+    // Accept both tap metadata and an already-canonical capture record. The
+    // extension posts the canonical record to /capture/meta before the audio;
+    // older code ignored it during /capture/finalize and rebuilt the sidecar
+    // from a null `clip`, erasing metadata that had already been recovered.
+    const song = meta.song || {};
+    const media = meta.media || {};
+    const id = meta.clip?.id || meta.clipId || meta.clip_id || song.id || null;
+    const clip = meta.clip || {
+      id,
+      title: meta.title || song.title || null,
+      duration_s: song.duration_s || audio.duration_s || null,
+      model_name: song.model_name || null,
+      major_model_version: song.major_model_version || null,
+      created_at: song.created_at || null,
+      image_url: song.image_url || null,
+      explicit: song.explicit ?? false,
+      is_download_unlocked: song.is_download_unlocked ?? null,
+      audio_url: media.audio_url || null,
+      media_urls: media.media_urls || [],
+      metadata: {
+        duration: song.duration_s || audio.duration_s || null,
+        tags: song.style_tags || null,
+        gpt_description_prompt: song.style_prompt || null,
+        prompt: song.lyrics || null,
+        make_instrumental: song.instrumentals ?? false,
+      },
+    };
     const rec = makeCaptureRecord({
       clip, session: { capture_id: captureId },
-      listen: meta.listen || null,
+      listen: meta.listen || meta.listen_state || null,
       audio: { ...audio, target_lufs: meta.target_lufs ?? -14, correction_mode: meta.correction || 'live', cdn_expiry: meta.cdn_expiry || null },
       cues: meta.cues || [], origin: 'desktop', sunoTelemetry: meta.suno_telemetry || null,
     });

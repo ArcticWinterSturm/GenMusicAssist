@@ -30,6 +30,53 @@ import { round, clamp01, num, fmtClock } from './util.js';
 const fmt = fmtClock;
 
 export const SCHEMA_VERSION = 'sunolift.capture/1';
+
+/**
+ * A different UUID from the player/network is a definitive track transition.
+ * Deliberately accepts no duration: generated songs often have equal or nearly
+ * equal lengths, so duration is corroborating telemetry, never identity.
+ */
+export function shouldRolloverCapture(currentId, candidateId, source) {
+  const strong = source === 'network' || String(source || '').startsWith('active-');
+  return Boolean(strong && currentId && candidateId && currentId !== candidateId);
+}
+
+/**
+ * Decide whether a media element is stable enough to start a new take.
+ *
+ * Suno's MSE player has a real handoff state between adjacent songs: it first
+ * selects the next queue UUID and POSTs playbar_state="paused" at 0 seconds,
+ * then (several seconds later) publishes the new finite duration and POSTs
+ * playbar_state="playing".  Browser `play` events and stale readyState values
+ * can occur inside that gap. Starting a recorder there produces the exact
+ * zero-byte phantom capture seen in the field.
+ */
+export function captureStartGate({
+  duration,
+  currentTime = 0,
+  readyState = 0,
+  ended = false,
+  clipId = null,
+  networkClipId = null,
+  networkState = null,
+  networkAgeMs = Infinity,
+  identityPending = false,
+} = {}) {
+  const d = Number(duration);
+  if (!Number.isFinite(d) || d <= 0) return { ok: false, reason: 'duration-unavailable' };
+  if (Number(readyState) < 3) return { ok: false, reason: 'media-not-ready' };
+  // MSE can leave `ended` true while replacing its source. Match the playback
+  // loop's semantics: only trust ended when the playhead is actually near end.
+  if (ended && d - Number(currentTime || 0) < 3) return { ok: false, reason: 'media-ended' };
+
+  const freshQueueState = networkClipId && Number(networkAgeMs) < 10000;
+  const atStart = !Number.isFinite(Number(currentTime)) || Number(currentTime) <= 0.25;
+  if (atStart && identityPending) return { ok: false, reason: 'identity-pending' };
+  if (freshQueueState && atStart && networkState && networkState !== 'playing') {
+    return { ok: false, reason: `playbar-${networkState}` };
+  }
+  return { ok: true, reason: 'ready' };
+}
 export const MILESTONE_THRESHOLDS = [
   { threshold: 5, milestone: '5s', actionName: 'SongPlayed5s' },
   { threshold: 30, milestone: '30s', actionName: 'SongPlayed30s' },
@@ -430,9 +477,9 @@ export function sidecarTxt(rec) {
   return lines.join('\n') + '\n';
 }
 
-export function sidecarCue(rec) {
+export function sidecarCue(rec, audioFilename = null) {
   const title = (rec.song?.title || 'Untitled').replace(/"/g, "'");
-  const file = `${title}.${rec.audio?.container || 'webm'}`;
+  const file = String(audioFilename || `${title}.${rec.audio?.container || 'webm'}`).replace(/"/g, "'");
   const out = [`PERFORMER "Suno AI"`, `TITLE "${title}"`, `REM SUNO_CLIP_ID ${rec.clip_id || ''}`, `REM CAPTURE_ID ${rec.capture_id || ''}`, `REM LISTEN_ACCRUED ${rec.listen_state?.accrued_seconds ?? 0}`, `REM COVERAGE ${rec.listen_state?.coverage ?? 0}`, `FILE "${file}" WAVE`];
   (rec.segments || []).forEach((g, i) => out.push(`  TRACK ${String(i + 1).padStart(2, '0')} AUDIO`, `    TITLE "${g.label} ${fmt(g.start)}-${fmt(g.end)}"`, `    INDEX 01 ${mmssCue(g.start)}`));
   if (!out.length) out.push('  TRACK 01 AUDIO', '    INDEX 01 00:00:00');

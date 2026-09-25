@@ -165,12 +165,56 @@ async function saveLibraryEntry(rec) {
  * capture finalisation                                               *
  * ------------------------------------------------------------------ */
 const pending = new Map();   // captureId -> { meta, bytes[], started }
+const clipCache = new Map(); // clipId -> { clip, at } — avoids re-fetching the same clip
+
+/**
+ * Fetch the full clip record from Suno's API, with a short in-memory cache.
+ * The page cannot do this (httpOnly cookies); the extension's SW can.
+ */
+async function resolveClip(clipId) {
+  if (!clipId || !/^[0-9a-f-]{36}$/.test(clipId)) return null;
+  const cached = clipCache.get(clipId);
+  if (cached && Date.now() - cached.at < 30 * 60 * 1000) return cached.clip;
+  try {
+    const c = await sunoFetch(`/api/clip/${clipId}`);
+    const normalized = L.normalizeClip(c);
+    clipCache.set(clipId, { clip: normalized, at: Date.now() });
+    return normalized;
+  } catch (e) {
+    console.warn('[sunolift] resolveClip failed:', clipId, e.message);
+    return null;
+  }
+}
 
 async function finalizeCapture(meta, blobBytes) {
   // blobBytes may be null when the caller only wants metadata re-derived from a
   // record already in IndexedDB (e.g. retrying a failed sidecar push).
   const durS = (meta.durationMs || 0) / 1000;
-  const clip = meta.clip || {};
+  let clip = meta.clip || {};
+  const identityId = (/^[0-9a-f-]{36}$/i.test(clip.id || '') && clip.id) ||
+    (/^[0-9a-f-]{36}$/i.test(meta.clipId || '') && meta.clipId) || null;
+  if (!clip.id && identityId) clip = { ...clip, id: identityId };
+  // Safety net: if the tap could not resolve metadata for a real clip id,
+  // try it now before the take is filed. The SW is authenticated; the page
+  // is not.
+  // Finalization is the authority boundary: resolve every real UUID, even when
+  // the page already supplied a complete-looking object. Completeness does not
+  // prove coherence—a transition race can combine the new clip's tags with the
+  // previous Media Session title. The authenticated API/cache gives one atomic
+  // record for this exact UUID.
+  if (identityId) {
+    const full = await resolveClip(identityId);
+    if (full) {
+      meta.clip = full;
+      clip = full;
+    }
+  }
+  // Preserve title-only evidence if the authenticated lookup was unavailable.
+  // A non-null honest title is preferable to an entirely blank sidecar; only a
+  // verified UUID is ever promoted to clip_id.
+  if (!clip.title && meta.title) clip.title = meta.title;
+  if (identityId && !clip.id) clip.id = identityId;
+  meta.clip = clip;
   const audio = {
     bytes: blobBytes ? blobBytes.length : meta.bytes,
     mime: meta.mime, container: /mp4/.test(meta.mime || '') ? 'mp4' : 'webm',
@@ -183,6 +227,20 @@ async function finalizeCapture(meta, blobBytes) {
     cdn_expiry: null,
     gain_timeline: meta.gain_timeline,
   };
+  // If the tap fetched structural analysis (sections, downbeats, lyrics),
+  // build segment-level metadata for the capture record.
+  if (meta.structure && !meta.structure.error) {
+    try {
+      const sections = L.normalizeSections?.(meta.structure.sections) || [];
+      const downbeats = L.normalizeDownbeats?.(meta.structure.downbeats) || [];
+      const lyrics = L.normalizeAlignedLyrics?.(meta.structure.lyrics) || [];
+      const dur = durS || null;
+      const covered = (meta.listen?.covered_intervals) || [];
+      audio.segments = L.buildSegmentMap({ duration: dur, covered, sections, downbeats, lyrics });
+    } catch (e) {
+      console.warn('[sunolift] buildSegmentMap failed:', e?.message || e);
+    }
+  }
   const rec = L.makeCaptureRecord({ clip, session: { capture_id: meta.captureId }, listen: meta.listen, audio, cues: [], origin: 'extension' });
   rec.curation = L.triageScore(rec);
   rec.media.cdn_expiry = null;
@@ -208,8 +266,15 @@ async function finalizeCapture(meta, blobBytes) {
     if (up.ok) { rec.storage = { via: 'sidecar', path: up.path, files: up.files }; await saveLibraryEntry(rec); autoKeepAfterSave(); return rec; }
     rec.storage = { via: 'browser', reason: up.error };
   }
-  // ALWAYS download when sidecar fails — the file MUST land on disk
-  if (cfg2.auto_download !== false && blobBytes && blobBytes.length > 8192) {
+  // ALWAYS download when sidecar fails — the file MUST land on disk.
+  // Fragment guard: reconcile-churn aborts mid-take and auto-capture
+  // immediately re-begins, which used to ship 10 KB "songs" (a few seconds
+  // of audio that passed the old >8192-byte guard). A real take of a real
+  // song is never under 15 s of audio; those fragments are debris, not
+  // takes — keep the library entry but do not write a file.
+  const FRAGMENT_MIN_BYTES = 15 * 48000 * 2 * 2; // ~15 s stereo opus @128k ≈ 240 KB
+  const isFragment = durS < 15 && blobBytes && blobBytes.length < FRAGMENT_MIN_BYTES;
+  if (cfg2.auto_download !== false && blobBytes && blobBytes.length > 8192 && !isFragment) {
     try {
       const fname = filenameFor(rec, audio.container);
       await saveBytes(blobBytes, fname, `captures`);
@@ -217,7 +282,7 @@ async function finalizeCapture(meta, blobBytes) {
       const base = filenameFor(rec, '').replace(/\.$/, '');
       await saveText(L.sidecarJson(rec), `${base}.json`, `captures`);
       await saveText(L.sidecarTxt(rec), `${base}.txt`, `captures`);
-      await saveText(L.sidecarCue(rec), `${base}.cue`, `captures`);
+      await saveText(L.sidecarCue(rec, fname), `${base}.cue`, `captures`);
       rec.storage = { via: 'downloads', path: `Downloads/captures/${fname}` };
     } catch (e) {
       console.warn('[sunolift] saveBytes failed:', e);
@@ -328,6 +393,30 @@ async function sidecar(path, opts = {}) {
 }
 async function pushToSidecar({ rec, blob, meta }) {
   try {
+    // Send a raw-clip-shaped object even when the page-side object arrived
+    // late. The canonical record already contains the metadata recovered by
+    // finalizeCapture; sending only `meta.clip` made the desktop sidecar turn a
+    // correctly recovered extension record blank again.
+    const canonicalClip = meta?.clip || {
+      id: rec.clip_id || rec.song?.id || null,
+      title: rec.song?.title || null,
+      duration_s: rec.song?.duration_s || null,
+      model_name: rec.song?.model_name || null,
+      major_model_version: rec.song?.major_model_version || null,
+      created_at: rec.song?.created_at || null,
+      image_url: rec.song?.image_url || null,
+      explicit: rec.song?.explicit ?? false,
+      is_download_unlocked: rec.song?.is_download_unlocked ?? null,
+      audio_url: rec.media?.audio_url || null,
+      media_urls: rec.media?.media_urls || [],
+      metadata: {
+        duration: rec.song?.duration_s || null,
+        tags: rec.song?.style_tags || null,
+        gpt_description_prompt: rec.song?.style_prompt || null,
+        prompt: rec.song?.lyrics || null,
+        make_instrumental: rec.song?.instrumentals ?? false,
+      },
+    };
     // The app's /capture/meta keys on meta.captureId (camelCase) while the
     // record carries capture_id (snake_case) — without the alias the POST
     // 400s and the whole sidecar path silently degrades to "app not
@@ -348,7 +437,8 @@ async function pushToSidecar({ rec, blob, meta }) {
       method: 'POST',
       body: JSON.stringify({
         capture_id: rec.capture_id,
-        clip: meta?.clip || null, listen: meta?.listen || null,
+        clipId: rec.clip_id || meta?.clipId || null,
+        clip: canonicalClip, listen: meta?.listen || rec.listen_state || null,
         durationMs: meta?.durationMs || 0, mime: meta?.mime || 'audio/webm;codecs=opus',
         sample_rate: meta?.sampleRate || 48000, ui_gain: meta?.ui_gain ?? null,
         gain_timeline: meta?.gain_timeline || null, target_lufs: meta?.target_lufs ?? -14,
@@ -618,6 +708,21 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       break;
     }
     case 'reflect': reflect({ kind: msg.kind, clipId: msg.clipId, milestone: msg.milestone, position: msg.position, accrued: msg.accrued, tabId }); reply(true); break;
+    case 'resolve-clip': {
+      (async () => {
+        const c = await resolveClip(msg.clipId);
+        if (c) {
+          // Broadcast to all pages so the tap instance for this clip can update.
+          chrome.tabs.query({ url: 'https://suno.com/*' }, (tabs) => {
+            for (const t of tabs || []) chrome.tabs.sendMessage(t.id, { source: 'sw', type: 'clip-resolved', clip: c }).catch(() => {});
+          });
+          reply({ ok: true, clip: c });
+        } else {
+          reply({ ok: false, error: 'resolveClip returned null' });
+        }
+      })().catch((e) => respond({ ok: false, error: String(e.message || e) }));
+      return true;
+    }
     case 'cue': {
       (async () => {
         const lib = await library();

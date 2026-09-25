@@ -103,7 +103,8 @@ def start_server():
     env = dict(os.environ, SUNOLIFT_ROOT=str(ROOT))
     flags = 0
     if os.name == "nt":
-        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        # CREATE_NO_WINDOW prevents a flashing console window
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     proc = subprocess.Popen(
         [find_node(), str(SERVER_JS), "serve", "--port", str(PORT), "--root", str(ROOT)],
         cwd=str(PROJECT), env=env,
@@ -155,6 +156,10 @@ def main():
             sys.exit(1)
 
     # Health snapshot
+    # Initialise ffmpeg_ok before try — if /ping times out the except block leaves
+    # it None (falsy), which is exactly what we want: the if/else below must fall
+    # through to the "needs ffmpeg" warnings, not crash with UnboundLocalError.
+    ffmpeg_ok = None
     try:
         import json
         with urlreq.urlopen(PING, timeout=3) as r:

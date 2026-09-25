@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GenMusicAssist — Suno Capture & Curation Studio",
-  "version": "1.0.1",
+  "version": "1.0.5",
   "minimum_chrome_version": "114",
   "description": "Volume-invariant capture of what Suno is playing, with per-segment listen metadata, curation scoring, and quota-safe export.",
   "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
@@ -33,7 +33,7 @@
     {
       "matches": ["https://suno.com/*"],
       "js": ["lib/sunolift-bundle.js", "content/tap.js"],
-      "run_at": "document_idle",
+      "run_at": "document_start",
       "world": "MAIN"
     },
     {

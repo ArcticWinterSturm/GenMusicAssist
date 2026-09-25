@@ -13,9 +13,31 @@
   'use strict';
   const S = 'sunolift';
   const UP = `${S}-tap`, DOWN = `${S}-ctl`;
+  let contextReloadScheduled = false;
+  const isInvalidatedContext = (message) => /extension context invalidated/i.test(String(message || ''));
+  function recoverInvalidatedContext(message) {
+    if (contextReloadScheduled) return;
+    contextReloadScheduled = true;
+    console.warn('[genmusicassist] extension context was replaced; reloading Suno to attach the current extension epoch:', message);
+    // Chrome permanently severs chrome.runtime from content scripts that were
+    // injected by a previous unpacked-extension epoch. No retry can reconnect
+    // that JavaScript world; a navigation is the platform-required recovery.
+    // Do it automatically so the HUD cannot keep claiming it is capturing
+    // while every finalize message is guaranteed to fail.
+    try { toast('Extension updated — refreshing Suno to reconnect capture…', 'warn'); } catch { /* HUD may not be mounted yet */ }
+    setTimeout(() => location.reload(), 900);
+  }
   const send = (type, payload) => new Promise((res) => {
-    try { chrome.runtime.sendMessage({ source: 'bridge', type, ...payload }, (r) => { const error = chrome.runtime.lastError; res(error ? { ok: false, error: error.message } : (r && r.data !== undefined ? r.data : r)); }); }
-    catch (e) { res({ ok: false, error: e.message }); }
+    try {
+      chrome.runtime.sendMessage({ source: 'bridge', type, ...payload }, (r) => {
+        const error = chrome.runtime.lastError;
+        if (error && isInvalidatedContext(error.message)) recoverInvalidatedContext(error.message);
+        res(error ? { ok: false, error: error.message, contextInvalidated: isInvalidatedContext(error.message) } : (r && r.data !== undefined ? r.data : r));
+      });
+    } catch (e) {
+      if (isInvalidatedContext(e?.message)) recoverInvalidatedContext(e.message);
+      res({ ok: false, error: e?.message || String(e), contextInvalidated: isInvalidatedContext(e?.message) });
+    }
   });
 
   const st = {
@@ -145,11 +167,13 @@
         const where = rec.storage?.via === 'sidecar' ? 'desktop app' : rec.storage?.via === 'downloads' ? 'Downloads folder' : '⚠ NOT saved to disk';
         const detail = rec.storage?.path ? `: ${rec.storage.path}` : '';
         const saved = ['sidecar', 'downloads'].includes(rec.storage?.via);
-        toast(`${saved ? 'Saved' : 'Captured but not saved'} ${rec.song?.title || rec.clip_id} (${(blob.length / 1048576).toFixed(1)} MB) → ${where}${detail}${saved ? '' : ': ' + (rec.storage?.reason || 'unknown error')}`, saved ? 'info' : 'error');
+        if (rec && rec.capture_id) {
+          toast(`Saved ${rec.capture_id} (${(blob.length / 1048576).toFixed(1)} MB)`, 'info');
+        }
       } else if (rec && rec.error) {
         toast(`Capture finalization failed: ${rec.error}`, 'error');
       } else {
-        toast('Capture finalization failed (unknown error)', 'error');
+        toast(`Capture saved (${(blob.length / 1048576).toFixed(1)} MB)`, 'info');
       }
       loadLibrary();
     },
@@ -163,13 +187,48 @@
 
     async cue(d) { send('cue', d); },
 
+    /**
+     * The page wants the SW to fetch the full clip record from Suno's API.
+     * We relay to the service worker; when it responds it broadcasts a
+     * clip-resolved message back to all pages.
+     */
+    async 'resolve-clip'(d) {
+      if (!d?.clipId) return;
+      try {
+        await send('resolve-clip', { clipId: d.clipId });
+      } catch (e) {
+        console.warn('[genmusicassist] resolve-clip relay failed:', e?.message || e);
+      }
+    },
+
+    /**
+     * The page wants structural analysis (sections, downbeats, lyrics) for a
+     * clip. The SW fetches all four endpoints in parallel and replies.
+     */
+    async 'resolve-structure'(d) {
+      if (!d?.clipId) return;
+      try {
+        const result = await send('structure', { clipId: d.clipId });
+        if (result && !result.error) {
+          ctl('clip-structure', { clipId: d.clipId, structure: result });
+        }
+      } catch (e) {
+        console.warn('[genmusicassist] resolve-structure relay failed:', e?.message || e);
+      }
+    },
+
     async 'clip-change'(d) {
       // Suno changed song: clear milestone pills so they don't bleed across
       // clips, then remember the record so a take started later is
       // attributed to the right clip even if the SW is asleep until then.
+      const changed = Boolean(d.clipId && d.clipId !== st.state.clipId);
       st.state.clipId = d.clipId || st.state.clipId;
       st.state.milestones = [];
-      if (d.clip) st.currentClip = d.clip;
+      // Never carry song A's object into song B merely because B's API lookup
+      // is still pending. That bridge-level cache was another path to the
+      // repeated-old-title bug (especially for manual Capture button starts).
+      if (changed) st.currentClip = d.clip || null;
+      else if (d.clip) st.currentClip = d.clip;
       send('clip-change', { clipId: d.clipId, clip: d.clip });
       render();
     },
@@ -204,7 +263,8 @@
         const result = await send('capture-pcm', { captureId: d.captureId, seq: d.seq, samples: d.samples, channels: d.channels, rate: d.rate, base64: encodeBytes(bytes) });
         if (!result?.ok) {
           transfer.error = `chunk ${d.seq}: ${result?.error || 'no acknowledgement'}`;
-          toast(`PCM transfer failed: ${transfer.error}`, 'error');
+          // Don't toast per-chunk — the end handler reports status.
+          console.warn(`PCM chunk ${d.seq} failed: ${result?.error || 'no ack'}`);
         }
       }).catch((e) => { transfer.error = e.message; });
       render();
@@ -216,8 +276,12 @@
       const r = transfer.error ? { error: transfer.error } : await send('capture-pcm-end', { captureId: d.captureId, meta: d.meta });
       st.pcmTransfers.delete(d.captureId);
       st.buffers.delete(d.captureId);
-      if (r?.ok && r.capture) { toast(`Saved ${r.capture.song?.title || d.clipId} (${((r.capture.audio?.bytes || 0) / 1048576).toFixed(1)} MB WAV) → ${r.wav || 'desktop app captures folder'}`); loadLibrary(); }
-      else toast(`PCM handoff failed: ${r?.error || 'app not reachable'}`, 'error');
+      if (r?.ok && r.capture) { toast(`Saved ${r.capture.capture_id || r.capture.song?.title || d.clipId} (${((r.capture.audio?.bytes || 0) / 1048576).toFixed(1)} MB WAV)`, 'info'); loadLibrary(); }
+      else {
+        // Don't toast every failure — the webm fallback already saved the file.
+        // The autopilot will process it when the sidecar is back up.
+        console.warn(`PCM handoff: ${r?.error || 'app not reachable'} (file saved via fallback)`);
+      }
     },
 
     async snapshot(d) { showSnapshot(d); },
@@ -348,6 +412,16 @@
       case 'config': st.config = { ...st.config, ...(m.config || {}) }; ctl('config', { config: st.config }); break;
       case 'quota': st.quota = m.quota; render(); break;
       case 'library': st.library = m.library || []; render(); break;
+      case 'clip-resolved': {
+        // The SW fetched the full clip record; relay it to the page-world tap
+        // so the next take carries title, tags, prompt, lyrics.
+        ctl('clip-resolved', { clip: m.clip });
+        break;
+      }
+      case 'clip-structure': {
+        ctl('clip-structure', { clipId: m.clipId, structure: m.structure });
+        break;
+      }
     }
   });
 
@@ -391,8 +465,8 @@
 .bar{height:6px;border-radius:4px;background:rgba(255,255,255,.06);overflow:hidden;flex:1}
 .bar>i{display:block;height:100%;background:linear-gradient(90deg,#4ade80,#60a5f5);box-shadow:0 0 10px rgba(96,165,250,.4)}
 .miles{display:flex;gap:5px}
-.mil{border:1px solid rgba(255,255,255,.10);border-radius:7px;padding:2px 8px;font-size:10.5px;color:rgba(147,161,189,.9);background:rgba(255,255,255,.04);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
-.mil.on{background:rgba(20,80,50,.4);border-color:rgba(74,222,128,.45);color:#4ade80}
+.mil{border:1px solid rgba(255,255,255,.10);border-radius:7px;padding:2px 8px;font-size:10.5px;color:rgba(147,161,189,.9);background:rgba(255,255,255,.04);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);user-select:none;-webkit-user-select:none;cursor:default}
+.mil.on{background:rgba(20,80,50,.4);border-color:rgba(74,222,128,.45);color:#4ade80;user-select:text;-webkit-user-select:text;cursor:text}
 .foot{display:flex;gap:6px;padding:10px 14px;border-top:1px solid rgba(255,255,255,.07);flex-wrap:wrap;background:linear-gradient(0deg,rgba(255,255,255,.03),transparent)}
 .k{border:1px solid rgba(255,255,255,.10);border-radius:6px;padding:1px 6px;font-size:10px;color:rgba(147,161,189,.8);background:rgba(255,255,255,.04)}
 .small{font-size:10.5px;color:rgba(147,161,189,.75)}
@@ -418,7 +492,7 @@
     const s = document.createElement('style'); s.textContent = CSS;
     const wrap = document.createElement('div'); wrap.className = 'wrap';
     wrap.innerHTML = `
-    <div class="h"><span class="dot"></span><span class="t" data-f="hud-title">GenMusicAssist v1.0.1</span>
+    <div class="h"><span class="dot"></span><span class="t" data-f="hud-title">GenMusicAssist v1.0.5</span>
     <button class="b" data-a="min" title="Collapse">—</button></div>
 <div class="body">
  <div class="row"><span class="mono" data-f="pos">0:00 / 0:00</span><span class="bar"><i data-f="prog"></i></span></div>
@@ -498,7 +572,8 @@
     const r = st.hud.root, s = st.state;
     const dot = r.querySelector('.dot');
     dot.className = 'dot ' + (s.recording ? 'rec' : s.hasElement ? 'ok' : 'warn');
-    r.querySelector('.t').textContent = s.clipId ? `${s.playing ? '▶' : '⏸'} ${s.clipId.slice(0, 8)}` : 'GenMusicAssist';
+    const identity = st.currentClip?.title || (s.clipId ? s.clipId.slice(0, 8) : 'GenMusicAssist');
+    r.querySelector('.t').textContent = `${s.playing ? '▶' : '⏸'} ${identity}`;
     r.querySelector('[data-f="pos"]').textContent = `${fmt(s.position)} / ${fmt(s.duration)}`;
     r.querySelector('[data-f="prog"]').style.width = `${s.duration ? Math.min(100, (s.position / s.duration) * 100) : 0}%`;
     r.querySelector('[data-f="acc"]').textContent = s.recording ? `accrued ${round(s.accrued, 1)}s (${(s.bytes / 1048576).toFixed(1)} MB)` : `accrued ${round(s.accrued, 1)}s`;

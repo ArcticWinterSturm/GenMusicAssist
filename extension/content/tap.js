@@ -83,6 +83,188 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * network observer — clip identity from Suno's own traffic           *
+   * ------------------------------------------------------------------ *
+   * DOM class hooks (.playing / [class*="isPlaying"]) drift with every
+   * Suno redesign, and every DOM fallback eventually degenerates into
+   * "first row in list order" — which pinned a whole session's takes on
+   * one old song at the top of the library. Suno's own traffic cannot
+   * lie: the page POSTs playbar_state with song_ids_in_queue +
+   * song_index, and fetches media with item_id=<uuid>. Watch both, keep
+   * the clip records that ride along in the JSON, and let the clip-id
+   * resolvers consult this evidence BEFORE any DOM sweep.
+   */
+  const net = { clips: new Map(), queueClip: null, queueState: null, queuePosition: null, queueAt: 0, itemHint: null, itemAt: 0, requested: new Map(), queue: [], queueIndex: 0 };
+  const UUID_SRC = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+  const isUuid = (v) => typeof v === 'string' && new RegExp(`^${UUID_SRC}$`, 'i').test(v);
+  const NET_ITEM_RE = new RegExp(`[?&]item_id=(${UUID_SRC})`, 'i');
+
+  function ingestJsonText(text) {
+    if (!text || typeof text !== 'string' || text.length < 2) return;
+    let data;
+    try { data = JSON.parse(text); } catch { /* RSC flight / non-JSON chunk */ return; }
+    try {
+      const seen = new Set(); const stack = [data]; let visited = 0;
+      while (stack.length && visited < 4000 && net.clips.size < 600) {
+        const v = stack.pop();
+        if (!v || typeof v !== 'object') continue;
+        if (seen.has(v)) continue;
+        seen.add(v);
+        if (!Array.isArray(v) && isUuid(v.id) &&
+            ('status' in v || 'media_urls' in v || 'audio_url' in v || 'model_name' in v || (v.metadata && typeof v.metadata === 'object'))) {
+          const prev = net.clips.get(v.id);
+          // a "complete"/"streaming" record always beats a stale "submitted" one
+          if (!prev || (prev.status === 'submitted' && v.status !== 'submitted') || ((v.media_urls || []).length > (prev.media_urls || []).length)) net.clips.set(v.id, v);
+          continue;
+        }
+        visited++;
+        if (Array.isArray(v)) { for (const x of v) stack.push(x); continue; }
+        for (const k of Object.keys(v)) {
+          if (k === 'waveform' || k === 'waveform_aggregates' || k === 'aligned_lyrics') continue;
+          const x = v[k];
+          if (x && typeof x === 'object') stack.push(x);
+        }
+      }
+    } catch { /* never break the page */ }
+  }
+
+  function ingestRequestUrl(url, bodyText) {
+    try {
+      const m = String(url || '').match(NET_ITEM_RE);
+      if (m && isUuid(m[1])) {
+        net.itemHint = m[1]; net.itemAt = Date.now();
+        net.requested.set(m[1], Date.now());
+      }
+      if (bodyText && /playbar_state/.test(String(url || ''))) {
+        const b = JSON.parse(bodyText);
+        const queue = Array.isArray(b?.song_ids_in_queue) ? b.song_ids_in_queue.filter(isUuid) : [];
+        if (queue.length) {
+          const idx = Number.isInteger(b?.song_index) ? Math.max(0, Math.min(b.song_index, queue.length - 1)) : 0;
+          net.queue = queue; net.queueIndex = idx;
+          net.queueClip = queue[idx];
+          net.queueState = String(b?.playbar_state || '').toLowerCase() || null;
+          net.queuePosition = Number.isFinite(Number(b?.song_play_time)) ? Number(b.song_play_time) : null;
+          net.queueAt = Date.now();
+        }
+      }
+    } catch { /* never break playback */ }
+  }
+
+  /**
+   * The clip Suno itself says is playing. The playbar_state POST is the
+   * authoritative signal (fresh queue index, posted every few seconds);
+   * the item_id= media request is second (fires at track start, but may
+   * also prefetch the NEXT track near the end of the current one — hence
+   * its shorter trust window).
+   */
+  function networkActiveClipId() {
+    const now = Date.now();
+    // At the instant a new song starts, its media request can precede the next
+    // periodic playbar_state update. Prefer that newer request only near the
+    // start of playback; later in a song it may be a prefetch for the next one.
+    const el = audioEl();
+    const nearStart = el && Number(el.currentTime) < 12;
+    if (nearStart && net.itemHint && isUuid(net.itemHint) && now - net.itemAt < 20000 && net.itemAt > net.queueAt) return net.itemHint;
+    if (net.queueClip && isUuid(net.queueClip) && now - net.queueAt < 90000) return net.queueClip;
+    if (net.itemHint && isUuid(net.itemHint) && now - net.itemAt < 20000) return net.itemHint;
+    return null;
+  }
+
+  function installNetworkObserver() {
+    // The content script can be hot-reloaded while the page stays open.  The
+    // wrappers installed by the first instance must feed the NEW instance's
+    // maps; otherwise the old epoch goes inert and every later take loses the
+    // one authoritative source of clip identity.
+    const observeResource = (name) => {
+      const m = String(name || '').match(NET_ITEM_RE);
+      if (!m || !isUuid(m[1])) return;
+      net.itemHint = m[1]; net.itemAt = Date.now(); net.requested.set(m[1], net.itemAt);
+    };
+    window.__genmusicassistNetSink = { ingestJsonText, ingestRequestUrl, observeResource };
+    if (window.__genmusicassistNetHooked) return;
+    window.__genmusicassistNetHooked = true;
+    try {
+      const origFetch = window.fetch;
+      if (typeof origFetch === 'function') {
+        window.fetch = function (input, init) {
+          let url = '';
+          try {
+            url = typeof input === 'string' ? input : (input && input.url) || '';
+            const body = init?.body;
+            if (typeof body === 'string') window.__genmusicassistNetSink?.ingestRequestUrl(url, body);
+            else if (body instanceof URLSearchParams) window.__genmusicassistNetSink?.ingestRequestUrl(url, body.toString());
+            else if (body instanceof Blob) body.text().then((t) => window.__genmusicassistNetSink?.ingestRequestUrl(url, t)).catch(() => {});
+            else if (!init?.body && typeof Request !== 'undefined' && input instanceof Request) {
+              input.clone().text().then((t) => window.__genmusicassistNetSink?.ingestRequestUrl(url, t)).catch(() => {});
+            }
+          } catch { /* arg shapes vary */ }
+          const p = origFetch.apply(this, arguments);
+          try {
+            p.then((resp) => {
+              try {
+                const ct = resp.headers.get('content-type') || '';
+                if (/json|text/i.test(ct)) resp.clone().text().then((t) => window.__genmusicassistNetSink?.ingestJsonText(t)).catch(() => {});
+              } catch { /* consumed body */ }
+            }).catch(() => {});
+          } catch { /* thenable shim missing */ }
+          return p;
+        };
+      }
+    } catch (e) { dbg('fetch hook failed', e); }
+    try {
+      if (window.XMLHttpRequest) {
+        const X = window.XMLHttpRequest.prototype;
+        const origOpen = X.open, origSend = X.send;
+        X.open = function (method, url) { this.__sunoliftUrl = String(url || ''); return origOpen.apply(this, arguments); };
+        X.send = function (body) {
+          try {
+            if (typeof body === 'string') window.__genmusicassistNetSink?.ingestRequestUrl(this.__sunoliftUrl, body);
+            else if (body instanceof URLSearchParams) window.__genmusicassistNetSink?.ingestRequestUrl(this.__sunoliftUrl, body.toString());
+            else if (body instanceof Blob) body.text().then((t) => window.__genmusicassistNetSink?.ingestRequestUrl(this.__sunoliftUrl, t)).catch(() => {});
+            this.addEventListener('load', () => {
+              try {
+                if (this.responseType === '' || this.responseType === 'text' || this.responseType === 'json') {
+                  window.__genmusicassistNetSink?.ingestJsonText(this.responseType === 'json' && this.response ? JSON.stringify(this.response) : this.responseText);
+                }
+              } catch { /* ignore */ }
+            });
+          } catch { /* ignore */ }
+          return origSend.apply(this, arguments);
+        };
+      }
+    } catch (e) { dbg('xhr hook failed', e); }
+    // Suno v6 sends playbar_state (and some telemetry) via navigator.sendBeacon
+    // — neither the fetch nor the XHR hook sees those, which left the observer
+    // blind on exactly the signal that cannot lie about what is playing.
+    try {
+      if (navigator.sendBeacon) {
+        const origBeacon = navigator.sendBeacon.bind(navigator);
+        navigator.sendBeacon = function (url, data) {
+          try {
+            const u = String(url || '');
+            if (typeof data === 'string') window.__genmusicassistNetSink?.ingestRequestUrl(u, data);
+            else if (data instanceof URLSearchParams) window.__genmusicassistNetSink?.ingestRequestUrl(u, data.toString());
+            else if (data && typeof Blob !== 'undefined' && data instanceof Blob) data.text().then((t) => window.__genmusicassistNetSink?.ingestRequestUrl(u, t)).catch(() => {});
+            else if (data && (data instanceof ArrayBuffer || ArrayBuffer.isView(data))) {
+                try { window.__genmusicassistNetSink?.ingestRequestUrl(u, new TextDecoder().decode(data)); } catch { /* not text */ }
+            }
+          } catch { /* never break the page */ }
+          return origBeacon(url, data);
+        };
+      }
+    } catch (e) { dbg('beacon hook failed', e); }
+    // Resource timing survives requests made before document_idle and also sees
+    // media loads made below application-level fetch wrappers.  Keep only the
+    // most recent item_id as a short-lived hint; playbar_state remains stronger.
+    try {
+      for (const e of performance.getEntriesByType('resource')) observeResource(e.name);
+      const po = new PerformanceObserver((list) => { for (const e of list.getEntries()) window.__genmusicassistNetSink?.observeResource(e.name); });
+      po.observe({ type: 'resource', buffered: true });
+      window.__genmusicassistResourceObserver = po;
+    } catch { /* resource timing unavailable */ }
+  }
+
+  /* ------------------------------------------------------------------ *
    * the graph                                                          *
    * ------------------------------------------------------------------ */
   function attach(el) {
@@ -245,7 +427,7 @@
   function sampleGain(el) {
     const t = st.ctx ? st.ctx.currentTime : (performance.now() / 1000);
     const g = el.muted ? 0 : (isFinite(el.volume) ? el.volume : 1);
-    st.timeline.add(t, g);
+    st.timeline?.add(t, g);
     if (st.gain) {
       const target = computeCompensation(g);
       // setTargetAtTime avoids the zipper noise you get from assigning .value
@@ -299,6 +481,27 @@
     if (st.recording || st.starting) return;
     const el = audioEl();
     if (!el) return;
+    // A Suno queue tickover briefly selects the NEXT UUID while the MSE media
+    // element is still 0:00/0:00 (and can even emit `play`). The HAR proves
+    // Suno calls this state `paused`; recording it creates a zero-byte phantom
+    // take immediately before the real capture. Gate every entry point here,
+    // including onPlay(), so no caller can bypass the handoff invariant.
+    const gate = L.captureStartGate ? L.captureStartGate({
+      duration: el.duration,
+      currentTime: el.currentTime,
+      readyState: el.readyState,
+      ended: el.ended,
+      clipId,
+      networkClipId: net.queueClip,
+      networkState: net.queueState,
+      networkAgeMs: Date.now() - net.queueAt,
+      identityPending: net.itemHint === clipId && net.itemAt > net.queueAt,
+    }) : { ok: Number.isFinite(Number(el.duration)) && Number(el.duration) > 0 && el.readyState >= 3 && !el.ended };
+    if (!gate.ok) {
+      st.armed = true;
+      dbg('capture start deferred', gate.reason, { clipId, duration: el.duration, readyState: el.readyState, queueState: net.queueState });
+      return;
+    }
     if (!attach(el)) return;
     st.starting = true;                        // cleared in startRecorder()'s go()/failure paths
     st.abortStart = false;
@@ -306,7 +509,11 @@
     st.chunks = []; st.chunkBytes = 0;
     st.timeline = L.GainTimeline ? new L.GainTimeline() : null;
     st.startedAt = Date.now();
-    st.clipId = clipId; st.clip = clip;
+    st.clipId = clipId;
+    // A title-only record is useful and honest when Suno temporarily hides the
+    // UUID.  Dropping the visible/media-session title here turned a safe
+    // anonymous take into a completely blank sidecar.
+    st.clip = clip || provisionalClip(clipId, el);
     if (L.ListenAccumulator && !st.acc) {
       st.acc = new L.ListenAccumulator((m, a, accrued) => {
         post('milestone', { milestone: m, action: a, accrued_seconds: round(accrued, 3), clipId });
@@ -328,12 +535,25 @@
       }
     }
     if (!usePcm) {
-      st.rec.ondataavailable = (ev) => {
+      // PER-RECORDER ISOLATION. The handlers close over THIS recorder and its
+      // own chunk array. stop() is asynchronous: the recorder's final chunk
+      // fires after end() — and often after begin() for the NEXT song has
+      // already reset the shared st.chunks. With the old shared-st handlers
+      // that late chunk landed at the head of the next take's file: the file
+      // began with the tail of the previous song and the EBML header sat
+      // kilobytes in — VLC showed undefined duration and playback jumped
+      // "backwards in time". The snapshot rides on the recorder instance too,
+      // so onstop finalises exactly its own take, nothing else.
+      const rec = st.rec;
+      const recChunks = [];
+      rec.__sunoliftChunks = recChunks;
+      rec.ondataavailable = (ev) => {
         if (!ev.data || !ev.data.size) return;
-        st.chunks.push(ev.data); st.chunkBytes += ev.data.size;
+        recChunks.push(ev.data);
+        st.chunkBytes += ev.data.size;
         post('progress', { bytes: st.chunkBytes, ms: Date.now() - st.startedAt });
       };
-      st.rec.onstop = flush;
+      rec.onstop = () => flush(rec);
     }
     // `recording` is claimed by startRecorder() AFTER the recorder is really
     // running. Claiming it here is what produced the wedged HUD: a suspended
@@ -366,6 +586,8 @@
       sampleRate: st.ctx?.sampleRate || st.config.sampleRate,
       uiGain: audioEl() ? (audioEl().muted ? 0 : audioEl().volume) : null,
       targetLufs: st.config.targetLufs,
+      correction: st.config.correction,
+      structure: st.structure || null,
     };
     if (st.engine === 'pcm') {
       snap.endedAt = Date.now();
@@ -378,14 +600,21 @@
       st.startedAt = 0;
       return;
     }
-    st.__flush = snap;
     st.chunks = []; st.chunkBytes = 0; st.startedAt = 0;
-    const hasRecorder = st.rec && typeof st.rec.stop === 'function';
+    const recorder = st.rec;
+    const hasRecorder = recorder && typeof recorder.stop === 'function';
     try {
-      if (hasRecorder) st.rec.stop();
-      else if (snap.chunkBytes > 0) flush();   // stopped before the recorder existed
-      else st.__flush = null;                  // nothing was ever captured: say nothing
-    } catch { flush(); }
+      if (hasRecorder) {
+        // Recorder.stop() completes asynchronously. Bind this take's metadata
+        // to THIS recorder exactly as we already bind its chunks; a shared
+        // st.__flush slot is overwritten when auto-capture starts/stops the
+        // next song before this onstop event arrives.
+        recorder.__sunoliftSnap = snap;
+        recorder.stop();
+      }
+      else if (snap.chunkBytes > 0) flush({ __sunoliftSnap: snap, __sunoliftChunks: snap.chunks || [] });
+      else { /* nothing was ever captured: say nothing */ }
+    } catch { flush({ __sunoliftSnap: snap, __sunoliftChunks: recorder?.__sunoliftChunks || snap.chunks || [] }); }
     // Do NOT detach — keep the audio graph alive for the next song.
     st.rec = null;
     dbg('recording end', reason);
@@ -405,25 +634,29 @@
         gain_timeline: timeline?.toJSON ? timeline.toJSON() : null,
         ui_gain: snap.uiGain, correction: 'offline', target_lufs: snap.targetLufs,
         source: 'webaudio-pcm-worklet',
+        structure: snap.structure || null,
       },
     });
   }
 
-  /** Ship the take as metadata + blob bytes in 1 MiB slices (message-size safe). */
-  async function flush() {
-    // Use the snapshot from end() if available — begin() may have already
-    // reset st.chunks for the next clip by the time onstop fires.
-    // Also append any chunks added after the snapshot (e.g. final chunk from rec.stop()).
-    const snap = st.__flush;
-    const chunks = snap ? [...snap.chunks, ...st.chunks] : st.chunks;
+  /** Ship the take as metadata + blob bytes in 1 MiB slices (message-size safe).
+   *  Takes the recorder explicitly: each recorder's onstop closes over its own
+   *  instance, so a late stop finalises exactly its own take even if the next
+   *  song's begin() has already run. */
+  async function flush(rec) {
+    // The recorder's OWN chunks are the truth. Reading the shared st.chunks
+    // here is what let a previous take's final async chunk bleed into the
+    // head of the next take's file (EBML header mid-file, "backwards" audio).
+    const chunks = rec ? (rec.__sunoliftChunks || []) : st.chunks;
+    const snap = rec ? rec.__sunoliftSnap : null;
     const startedAt = snap ? snap.startedAt : st.startedAt;
     const captureId = snap ? snap.captureId : st.captureId;
-    const clipId = snap ? snap.clipId : st.clipId;
-    const clip = snap ? snap.clip : st.clip;
+    let clipId = snap ? snap.clipId : st.clipId;
+    let clip = snap ? snap.clip : st.clip;
     const timeline = snap ? snap.timeline : st.timeline;
     const acc = snap ? snap.acc : st.acc;
     const endReason = snap ? snap.endReason : st.endReason;
-    st.__flush = null;
+    if (rec) { rec.__sunoliftSnap = null; rec.__sunoliftChunks = null; }
     st.chunks = [];
     const el = audioEl();
     const duration = Date.now() - startedAt;
@@ -431,17 +664,25 @@
     if (acc) acc.markCompleted?.();
     const listen = acc ? acc.toJSON(L.getKnownDurationSeconds ? L.getKnownDurationSeconds(clip || {}) : null) : null;
     const blob = new Blob(chunks, { type: pickMime() || 'audio/webm' });
+    // NOTE: We deliberately do NOT re-read the page here to "fix" attribution.
+    // The take began with a clip id captured at begin() time, and the audio
+    // content matches THAT clip. Re-attributing to whatever song happens to
+    // be playing when flush() runs would mis-label a perfectly good take
+    // (e.g. take recorded song A, but page auto-advanced to song B by the
+    // time onstop fired). The findClipIdFromPage() fix + tick() reconcile
+    // handle the streaming-session freeze; this path must not override them.
     const meta = {
       captureId, clipId,
-      clip: minimalClip(clip || (el ? currentClipFromPage() : null)),
+      clip: minimalClip(clip || null),
       listen, durationMs: duration, bytes: blob.size,
-      mime: blob.type, sampleRate: st.ctx ? st.ctx.sampleRate : st.config.sampleRate,
+      mime: blob.type, sampleRate: snap?.sampleRate || (st.ctx ? st.ctx.sampleRate : st.config.sampleRate),
       channels: 2,
       gain_timeline: timeline && timeline.toJSON ? timeline.toJSON() : null,
-      ui_gain: el ? (el.muted ? 0 : el.volume) : null,
-      correction: st.config.correction,
+      ui_gain: snap ? snap.uiGain : (el ? (el.muted ? 0 : el.volume) : null),
+      correction: snap?.correction || st.config.correction,
       endReason: endReason || 'manual',
-      target_lufs: st.config.targetLufs,
+      target_lufs: snap?.targetLufs ?? st.config.targetLufs,
+      structure: snap?.structure || null,
     };
     post('capture-meta', meta);
     // stream the bytes; the bridge relays to the SW (and through it, the app)
@@ -467,27 +708,131 @@
     };
   }
 
+  /** Current Media Session metadata is maintained by Suno's player itself. */
+  function mediaSessionClip() {
+    try {
+      const m = navigator.mediaSession?.metadata;
+      if (!m) return null;
+      const title = String(m.title || '').replace(/\s+/g, ' ').trim();
+      const haystack = [m.title, m.artist, m.album, ...(m.artwork || []).map((a) => a?.src)].filter(Boolean).join(' ');
+      const id = haystack.match(new RegExp(UUID_SRC, 'i'))?.[0] || null;
+      if (!title && !id) return null;
+      return { id, title: title || undefined, image_url: m.artwork?.at?.(-1)?.src || m.artwork?.[0]?.src || null, __from: 'media-session' };
+    } catch { return null; }
+  }
+
+  function provisionalClip(clipId, el = audioEl()) {
+    const ms = mediaSessionClip();
+    const active = document.querySelector?.('.playing, [class*="isPlaying"], [data-playing="true"], [aria-current="true"]');
+    const uuid = isUuid(clipId) ? clipId : null;
+    // A Media Session title is coherent with a UUID only when Media Session
+    // exposes that same UUID. During auto-advance its title can lag behind the
+    // network/player identity by several seconds.
+    const mediaTitle = !uuid || ms?.id === uuid ? ms?.title : null;
+    const title = mediaTitle || (active ? rowTitle(active) : '') || null;
+    const duration = el && isFinite(el.duration) && el.duration > 0 ? el.duration : null;
+    return {
+      id: uuid || ms?.id || null, title,
+      duration_s: duration, image_url: ms?.image_url || null,
+      metadata: duration ? { duration } : {}, __from: ms ? 'media-session' : 'provisional',
+    };
+  }
+
+  function anonymousTrackId(clip, el = audioEl()) {
+    const title = String(clip?.title || 'unknown');
+    const dur = el && isFinite(el.duration) ? Math.round(el.duration) : 0;
+    let h = 2166136261;
+    for (const ch of `${title}|${dur}`) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); }
+    return `anon_${(h >>> 0).toString(16).padStart(8, '0')}`;
+  }
+
+  /**
+   * Ask the extension (which IS authenticated via cookies) to fetch the full
+   * clip record from Suno's API. The page itself cannot — the session cookies
+   * are httpOnly. Without this, MSE-blob clips are filed as "Untitled" with
+   * no tags, prompt, or lyrics.
+   *
+   * We fire-and-retry: the first resolve often races the SW waking from idle,
+   * so a single missed response would leave the take orphaned.
+   */
+  function resolveClip(clipId) {
+    if (!clipId || !/^[0-9a-f-]{36}$/.test(clipId)) return;
+    if (st._resolving === clipId) return;
+    st._resolving = clipId;
+    post('resolve-clip', { clipId });
+    setTimeout(() => { if (st._resolving === clipId) { st._resolving = null; resolveClip(clipId); } }, 4000);
+  }
+
+  /**
+   * After clip resolution, optionally fetch structural analysis (sections,
+   * downbeats, lyrics alignment) so the saved take has segment-level
+   * metadata. Non-fatal: structure endpoints can fail; we still save the
+   * clip's core metadata.
+   */
+  function resolveStructure(clipId) {
+    if (!clipId || !/^[0-9a-f-]{36}$/.test(clipId)) return;
+    post('resolve-structure', { clipId });
+  }
+
   /* ------------------------------------------------------------------ *
    * clip discovery: read the clip Suno itself rendered into the page   *
    * ------------------------------------------------------------------ */
   function currentClipFromPage() {
-    // 1) data attributes Suno leaves on rows/cards
-    const sel = '[class*="SongRow"], [class*="song-row"], [data-clip-id], [id^="clip-"]';
-    const active = document.querySelector('.playing, [class*="isPlaying"], [data-playing="true"]');
-    const pool = active ? [active, ...document.querySelectorAll(sel)] : [...document.querySelectorAll(sel)];
-    for (const n of pool) {
-      const id = n.getAttribute?.('data-clip-id') || n.id?.replace(/^clip-/, '');
-      if (!id || !/^[0-9a-f-]{36}$/.test(id)) continue;
-      // Take the human name with the id. The row always shows it, and without
-      // it every capture is filed as "Untitled" — a curation tool that cannot
-      // name a file is no use to a musician.
-      const title = rowTitle(n);
-      return { id, title: title || undefined, __from: 'dom' };
+    const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+    const UUID_RE = new RegExp(`^${UUID}$`);
+    const SONG_RE = new RegExp(`/song/(${UUID})`);
+
+    // 0) SUNO'S OWN TRAFFIC FIRST — same evidence hierarchy as
+    //    findClipIdFromPage(): the playbar queue / media requests cannot be
+    //    fooled by DOM layout, and the reconcile loop in tick() depends on
+    //    this function never hallucinating "the first row in the library".
+    const netId = networkActiveClipId();
+    if (netId) {
+      const c = net.clips.get(netId);
+      const normalized = c ? (L.normalizeClip ? L.normalizeClip(c) : c) : null;
+      // Keep identity fields atomic: never attach a possibly stale Media
+      // Session title to a UUID learned from a different source.
+      return { ...(normalized || {}), id: netId, title: normalized?.title, __from: 'network' };
     }
-    // 2) the RSC flight payload on /song/{id} pages contains the full clip
-    const m = location.pathname.match(/^\/song\/([0-9a-f-]{36})/);
+
+    // Media Session is owned by the player and does not suffer from list-order
+    // ambiguity.  It often exposes the UUID through artwork URLs; even without
+    // one it preserves the correct human title for an anonymous take.
+    const media = mediaSessionClip();
+    if (media?.id) return media;
+
+    // 1) ACTIVE ROW FIRST — must prefer the playing track over the rest of
+    //    the library list.
+    const active = document.querySelector('.playing, [class*="isPlaying"], [data-playing="true"], [aria-current="true"]');
+    if (active) {
+      // audiopipe item_id= in the active subtree (most specific signal)
+      const activeNodes = [active, ...(active.querySelectorAll('*') || [])];
+      for (const n of activeNodes) {
+        for (const attr of n.attributes || []) {
+          const m = attr.value && attr.value.match(new RegExp(`item_id=(${UUID})`));
+          if (m) return { id: m[1], title: rowTitle(active) || undefined, __from: 'active-itemid' };
+        }
+      }
+      // /song/<uuid> link inside or wrapping the active row
+      const songLink = active.querySelector?.('a[href*="/song/"]') || active.closest?.('a[href*="/song/"]');
+      if (songLink) {
+        const hrefMatch = songLink.getAttribute('href')?.match(SONG_RE);
+        if (hrefMatch) {
+          const title = rowTitle(active);
+          return { id: hrefMatch[1], title: title || undefined, __from: 'active-href' };
+        }
+      }
+      // data-clip-id on the active row itself
+      const id = active.getAttribute?.('data-clip-id') || (active.id && active.id.replace(/^clip-/, ''));
+      if (id && UUID_RE.test(id)) {
+        return { id, title: rowTitle(active) || undefined, __from: 'active-data' };
+      }
+    }
+
+    // 2) the route is authoritative only on an individual /song/{id} page.
+    const m = location.pathname.match(SONG_RE);
     if (m) return { id: m[1], __from: 'route' };
-    return null;
+    return media;
   }
 
   /** The visible name of a song row, in the row's own language. */
@@ -513,28 +858,66 @@
   function findClipIdFromPage() {
     try {
       const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
-      const re = new RegExp(`item_id=(${UUID})`);
-      const active = document.querySelector('.playing, [class*="isPlaying"], [data-playing="true"], [aria-current="true"]');
-      const nodes = active ? [active, ...active.querySelectorAll('*')] : [];
-      for (const n of nodes) {
-        for (const attr of n.attributes || []) {
-          const m = attr.value && attr.value.match(re);
+      const UUID_RE = new RegExp(`^${UUID}$`);
+      const SONG_RE = new RegExp(`/song/(${UUID})`);
+      const ITEM_RE = new RegExp(`item_id=(${UUID})`);
+
+      // Extract a clip id from a single node and its descendants (attributes +
+      // /song/ links + data-clip-id). Returns null if nothing matches.
+      function fromNode(node) {
+        if (!node) return null;
+        const nodes = [node, ...(node.querySelectorAll('*') || [])];
+        for (const n of nodes) {
+          // audiopipe item_id= is the most specific signal — prefer it
+          for (const attr of n.attributes || []) {
+            const m = attr.value && attr.value.match(ITEM_RE);
+            if (m) return m[1];
+          }
+        }
+        const songLink = node.querySelector?.('a[href*="/song/"]');
+        if (songLink) {
+          const href = songLink.getAttribute('href') || '';
+          const m = href.match(SONG_RE);
           if (m) return m[1];
         }
+        const id = node.getAttribute?.('data-clip-id') || (node.id && node.id.replace(/^clip-/, ''));
+        if (id && UUID_RE.test(id)) return id;
+        return null;
       }
-      // Whole-DOM sweep as fallback (cheap enough at ~1 Hz; the player row
-      // usually wins first).
-      const html = document.documentElement.innerHTML;
-      const hits = html.match(new RegExp(`item_id=(${UUID})`, 'g')) || [];
-      if (hits.length === 1) return hits[0].slice('item_id='.length);
-      // Multiple hits: prefer one that also appears in the RSC flight data
-      // with a title (the clip object), else the first.
-      for (const h of hits) {
-        const id = h.slice('item_id='.length);
-        const clip = scanFlightPayload(id);
-        if (clip) return id;
+
+      // 0) SUNO'S OWN TRAFFIC FIRST — the playbar_state POST carries
+      //    song_ids_in_queue + song_index, and the media request carries
+      //    item_id=<uuid>. Neither can be fooled by DOM layout, and both
+      //    update the instant the track flips. This is what stops the
+      //    "everything is attributed to the first row in the library"
+      //    failure mode for good.
+      const netId = networkActiveClipId();
+      if (netId) return netId;
+
+      // 1) ACTIVE/PLAYING ROW FIRST — the only authoritative DOM source.
+      const active = document.querySelector('.playing, [class*="isPlaying"], [data-playing="true"], [aria-current="true"]');
+      if (active) {
+        const id = fromNode(active);
+        if (id) return id;
       }
-      return hits.length ? hits[0].slice('item_id='.length) : null;
+
+      // 2) Media Session artwork frequently embeds the current clip UUID.
+      const mediaId = mediaSessionClip()?.id;
+      if (mediaId && UUID_RE.test(mediaId)) return mediaId;
+
+      // 3) /song/{id} route names the clip directly.
+      const route = location.pathname.match(SONG_RE);
+      if (route) return route[1];
+
+      // NO whole-DOM sweep. The old `document.documentElement.innerHTML`
+      // item_id= regex returned the FIRST hit in DOM order — on the library
+      // page that is the top row of the list, not the playing track. That
+      // fallback is what pinned an entire session on one library row
+      // (always the top of the list, never the playing track).
+      // When nothing above matched we return null: auto-capture then
+      // synthesises a blob_ id and promotes it later, which is strictly
+      // better than attributing the take to the wrong song.
+      return null;
     } catch { return null; }
   }
 
@@ -582,7 +965,12 @@
     const el = audioEl();
     if (!el) return;
     const now = performance.now();
-    const isPlaying = !el.paused && !el.ended && el.readyState > 2;
+    // MSE players fire a spurious `ended` when they rebuffer or detach the
+    // media source mid-song. Treat the element as playing if the playhead is
+    // advancing and is NOT near the end, regardless of what el.ended reports.
+    const dur = isFinite(el.duration) && el.duration > 0 ? el.duration : 0;
+    const isNearEnd = dur > 0 && (dur - el.currentTime) < 3;
+    const isPlaying = !el.paused && el.readyState > 2 && (!el.ended || !isNearEnd);
     // Make sure the AudioContext exists early so we can read its state.
     if (!st.ctx && st.bound) ensureContext();
     if (now - st.lastPost > 200) {
@@ -629,12 +1017,16 @@
           // Prefer the REAL clip id from the page DOM (item_id= in the player
           // row's media URLs); only fall back to a synthetic id when the page
           // genuinely hides it.
-          st.clipId = findClipIdFromPage() || `blob_${Date.now().toString(36)}`;
+          const pageClip = currentClipFromPage() || provisionalClip(null, el);
+          st.clipId = findClipIdFromPage() || anonymousTrackId(pageClip, el);
+          // Resolve the real clip from Suno's API so we get title, tags,
+          // prompt, lyrics — even when the route is opaque (MSE blob URLs).
+          if (/^[0-9a-f-]{36}$/.test(st.clipId)) resolveClip(st.clipId);
         } else {
           // src changed but carried no id: keep the current attribution rather
           // than inventing one. (No-op self-assignment removed.)
         }
-        st.clip = currentClipFromPage() || null;
+        st.clip = currentClipFromPage() || provisionalClip(st.clipId, el);
         if (L.ListenAccumulator) {
           st.acc = new L.ListenAccumulator((m, a, accrued) => {
             post('milestone', { milestone: m, action: a, accrued_seconds: round(accrued, 3), clipId: st.clipId });
@@ -648,6 +1040,45 @@
     st.lastSrc = el.currentSrc || el.src;
     st.lastTime = el.currentTime;
     st.lastDuration = el.duration;
+    // Mid-take promotion: if we started on a synthetic blob_ id (the page
+    // could not name the clip at begin() time), re-resolve every ~2.5 s and
+    // adopt the real uuid the moment the observer / active row can name it.
+    // Without this the take keeps the blob_ id forever: filename "blob_muc…",
+    // zero metadata, and finalizeCapture skips its own re-resolve because the
+    // id is not a real clip id.
+    const wall = Date.now();
+    if (st.clipId && /^(?:blob|anon)_/.test(String(st.clipId)) && wall - (st._lastResolve || 0) > 2500) {
+      st._lastResolve = wall;
+      const real = findClipIdFromPage();
+      if (real && isUuid(real) && real !== st.clipId) {
+        const raw = net.clips.get(real);
+        const clipObj = raw ? (L.normalizeClip ? L.normalizeClip(raw) : raw) : null;
+        // adopt WITHOUT ending the take: the audio recorded so far belongs to
+        // this clip; only the attribution was missing.
+        st.clipId = real;
+        st.clip = clipObj || st.clip;
+        if (st.engine === 'pcm') { /* pcmTakes keyed by captureId — unaffected */ }
+        // Keep the accumulator: this is an identity promotion for the SAME
+        // audio, not a track transition. Resetting here erased the seconds
+        // heard before the UUID appeared.
+        if (clipObj) post('clip-change', { clipId: real, clip: minimalClip(clipObj), why: 'mid-take-resolve' });
+        else resolveClip(real);
+        dbg('mid-take promotion', st.clipId);
+      }
+    }
+    // Hydrate clip metadata when the API record arrives after the take started.
+    if (st.clipId && isUuid(st.clipId) && wall - (st._lastHydrate || 0) > 4000) {
+      st._lastHydrate = wall;
+      if (!st.clip || !st.clip.title || !(st.clip.media_urls || []).length) {
+        const raw = net.clips.get(st.clipId);
+        const c = (raw ? (L.normalizeClip ? L.normalizeClip(raw) : raw) : null) || scanFlightPayload(st.clipId);
+        if (c && (c.title || (c.media_urls || []).length)) {
+          st.clip = c;
+          post('clip-change', { clipId: st.clipId, clip: minimalClip(c), why: 'hydrate' });
+        }
+      }
+    }
+
     // Auto-capture: only start if the context is running. If it's suspended,
     // Chrome requires a user gesture to resume — begin() handles that via
     // startRecorder(), but we should only call it when the graph is live.
@@ -656,15 +1087,22 @@
     // element may already be playing when the script loads.
     if (st.config.autoCapture && isPlaying && !st.recording) {
       if (!st.clipId && st.lastSrc && st.lastSrc.startsWith('blob:')) {
-        st.clipId = `blob_${Date.now().toString(36)}`;
-        post('clip-change', { clipId: st.clipId });
+        st.clip = provisionalClip(null, el);
+        st.clipId = anonymousTrackId(st.clip, el);
+        post('clip-change', { clipId: st.clipId, clip: minimalClip(st.clip) });
       }
       if (st.clipId) {
-        // Pull the REAL clip object (title, prompt, tags, media_urls) from the
-        // page whenever we can — the saved file must say "Midnight Shadows /
-        // dark jazz", not "Untitled". Cheap: only when unbound so far.
+        // Pull the REAL clip object (title, prompt, tags, media_urls) from
+        // the page or the network observer's cache whenever we can — the
+        // saved file must say the real title, not "Untitled".
         if (!st.clip || !st.clip.id || st.clip.id !== st.clipId) {
-          st.clip = (scanFlightPayload(st.clipId) || currentClipFromPage() || st.clip);
+          const raw = net.clips.get(st.clipId);
+          const fromNet = raw ? (L.normalizeClip ? L.normalizeClip(raw) : raw) : null;
+          st.clip = (fromNet || scanFlightPayload(st.clipId) || currentClipFromPage() || st.clip);
+        }
+        // If the page couldn't name it, ask the SW to fetch it from the API.
+        if (/^[0-9a-f-]{36}$/.test(st.clipId) && (!st.clip || !st.clip.title || !st.clip.metadata?.tags)) {
+          resolveClip(st.clipId);
         }
         // A SUSPENDED context cannot feed the worklet — begin() would repeat
         // the 0-byte-take failure. Only start when the graph is live (the
@@ -675,6 +1113,67 @@
       }
     }
     if (st.config.maxRecordMs && st.recording && Date.now() - st.startedAt > st.config.maxRecordMs) end('max-duration');
+    // PERIODIC PAGE RECONCILE: Suno v6 reuses the same MSE blob URL across
+    // tracks on the library page, so the srcChanged signal in the detector
+    // above can stay false even after the song flips. Every ~2 s while
+    // recording, re-read the page; if the active row names a DIFFERENT clip
+    // than what we recorded, STOP the current take (so audio doesn't bleed
+    // across songs) and let the auto-capture cycle start a fresh take for
+    // the new track.
+    if (st.recording && st.clipId && now - (st._lastReconcile || 0) > 2000) {
+      st._lastReconcile = now;
+      const live = currentClipFromPage();
+      // Only network/player evidence may roll over a take. Once such a source
+      // supplies a different UUID, that identity change is definitive; song
+      // duration must not veto it. Suno commonly generates adjacent tracks at
+      // nearly identical target lengths (the reported failure is 3:04 -> 3:02).
+      const rollover = live && (L.shouldRolloverCapture
+        ? L.shouldRolloverCapture(st.clipId, live.id, live.__from)
+        : ((live.__from === 'network' || String(live.__from || '').startsWith('active-')) && live.id && live.id !== st.clipId));
+      if (rollover) {
+        dbg('tick: periodic reconcile found new clip', st.clipId, '->', live.id, live.title);
+        if (st.recording) end('clip-change');
+        st.clipId = live.id;
+        const raw = net.clips.get(live.id);
+        st.clip = (raw ? (L.normalizeClip ? L.normalizeClip(raw) : raw) : null) || live;
+        if (L.ListenAccumulator) {
+          st.acc = new L.ListenAccumulator((m, a, accrued) => {
+            post('milestone', { milestone: m, action: a, accrued_seconds: round(accrued, 3), clipId: st.clipId });
+          });
+        }
+        st.startedAt = 0;
+        if (/^[0-9a-f-]{36}$/.test(live.id)) resolveClip(live.id);
+        post('clip-change', { clipId: live.id, clip: minimalClip(st.clip), reconcile: true });
+      }
+    }
+
+    // Last-resort rollover signal: Media Session follows the actual bottom
+    // player even when Suno reuses one blob URL and sends no observable API
+    // traffic.  A changed non-empty title plus a reset playhead is strong
+    // enough to split the take, but a title merely appearing late is not.
+    const media = mediaSessionClip();
+    const mediaTitle = String(media?.title || '').trim();
+    if (mediaTitle) {
+      const previousTitle = String(st._lastMediaTitle || '').trim();
+      const resetForNewSong = el.currentTime < 8 && (st.lastTime > 8 || (st.clip?.title && st.clip.title !== mediaTitle));
+      if (st.recording && previousTitle && mediaTitle !== previousTitle && resetForNewSong) {
+        end('clip-change');
+        const detected = media.id || findClipIdFromPage();
+        // A detector that still reports the old UUID is stale. Preserve the
+        // new title under an anonymous identity instead of reviving the old-
+        // song-name regression.
+        const id = detected && detected !== st.clipId ? detected : anonymousTrackId(media, el);
+        st.clipId = id;
+        st.clip = { ...provisionalClip(id, el), ...media, id: isUuid(id) ? id : null };
+        if (L.ListenAccumulator) st.acc = new L.ListenAccumulator((m, a, accrued) => {
+          post('milestone', { milestone: m, action: a, accrued_seconds: round(accrued, 3), clipId: st.clipId });
+        });
+        post('clip-change', { clipId: id, clip: minimalClip(st.clip), why: 'media-session-title' });
+      } else if ((!st.clip || !st.clip.title) && mediaTitle) {
+        st.clip = { ...(st.clip || provisionalClip(st.clipId, el)), ...media, id: isUuid(st.clipId) ? st.clipId : (media.id || null) };
+      }
+      st._lastMediaTitle = mediaTitle;
+    }
   }
 
   const round = (v, d = 3) => { const p = 10 ** d; return Math.round((Number(v) || 0) * p) / p; };
@@ -687,20 +1186,30 @@
     if (st.ctx && st.ctx.state === 'suspended') st.ctx.resume().catch(() => {});
     const src = el.currentSrc || el.src || '';
     const m = src.match(/item_id=([0-9a-f-]{36})/) || src.match(/clip\/([0-9a-f-]{36})/) || location.pathname.match(/\/song\/([0-9a-f-]{36})/);
-    let id = m ? m[1] : st.clipId;
+    const pageClip = currentClipFromPage();
+    const pageId = findClipIdFromPage();
+    const pageTitle = String(pageClip?.title || '').trim();
+    const oldTitle = String(st.clip?.title || '').trim();
+    // Re-detect on EVERY play event. Falling back to st.clipId first froze the
+    // first UUID for an entire continuous stream.
+    let id = m ? m[1] : pageId;
+    if (id && id === st.clipId && pageTitle && oldTitle && pageTitle !== oldTitle) id = null;
     // Suno v6 uses MSE blob URLs — no clip id is recoverable from the element.
     // The page itself still knows the id: the player row carries a media URL
     // with item_id=<uuid>, and the RSC payload has the full clip object.
-    if (!id) id = findClipIdFromPage() || st.clipId;
+    if (!id && (!pageTitle || pageTitle === oldTitle)) id = st.clipId;
     // Last resort: a generated clip id so auto-capture can actually start.
     if (!id && src.startsWith('blob:')) {
-      id = el.__genmusicassistClipId || `blob_${Date.now().toString(36)}`;
+      const provisional = pageClip || provisionalClip(null, el);
+      id = anonymousTrackId(provisional, el);
       el.__genmusicassistClipId = id;
     }
     if (id && id !== st.clipId) {
       if (st.recording && st.clipId && id !== st.clipId) end('clip-change');
       st.clipId = id;
-      st.clip = (id && scanFlightPayload(id)) || currentClipFromPage();
+      const raw = net.clips.get(id);
+      const fromNet = raw ? (L.normalizeClip ? L.normalizeClip(raw) : raw) : null;
+      st.clip = fromNet || (isUuid(id) && scanFlightPayload(id)) || pageClip || provisionalClip(id, el);
       post('clip-change', { clipId: id, clip: minimalClip(st.clip) });
       // New clip = new accumulator for milestone tracking
       if (L.ListenAccumulator) {
@@ -708,6 +1217,11 @@
           post('milestone', { milestone: m, action: a, accrued_seconds: round(accrued, 3), clipId: st.clipId });
         });
       }
+    }
+    // Always ask the SW to pull the full clip from the API if we don't yet
+    // have real metadata. Cheap: the SW caches per clip id for the session.
+    if (id && (!st.clip || !st.clip.title || !st.clip.metadata || !st.clip.metadata.tags)) {
+      resolveClip(id);
     }
     if (st.config.autoCapture && id && !st.recording) begin(id, st.clip, 'play');
   }
@@ -726,14 +1240,31 @@
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       const el = audioEl();
-      if (el && (el.paused || el.ended) && st.recording) {
-        if (st.acc && el.ended) st.acc.markCompleted?.();
-        end(el.ended ? 'ended' : 'paused-idle');
+      if (!el || !st.recording) return;
+      // Verify the song actually ended before stopping. MSE players can
+      // dispatch a spurious `ended` when they rebuffer mid-song; without
+      // this check, a pause at 17s into a 3:02 track truncates the take.
+      const dur = isFinite(el.duration) && el.duration > 0 ? el.duration : 0;
+      const trulyEnded = el.ended && dur > 0 && (dur - el.currentTime) < 3;
+      const trulyPaused = el.paused && !trulyEnded;
+      if (trulyEnded || trulyPaused) {
+        if (st.acc && trulyEnded) st.acc.markCompleted?.();
+        end(trulyEnded ? 'ended' : 'paused-idle');
       }
     }, 6000);
   }
 
   function onEnded() {
+    // MSE players dispatch a spurious `ended` when they rebuffer or detach
+    // the media source mid-song. Verify the playhead is actually near the end
+    // before treating the take as complete — otherwise a false `ended` at
+    // 17 s into a 3:02 song silently truncates the capture.
+    const el = audioEl();
+    const dur = el && isFinite(el.duration) && el.duration > 0 ? el.duration : 0;
+    if (dur > 0 && (dur - el.currentTime) > 3) {
+      dbg('onEnded ignored: false ended at', el.currentTime, 'dur', dur, 'remaining', round(dur - el.currentTime, 1));
+      return;
+    }
     if (st.acc) st.acc.markCompleted();
     post('milestone', { clipId: st.clipId, milestone: 'completed', action: 'SongCompleted' });
     if (st.recording) end('ended');
@@ -802,12 +1333,21 @@
     dbg('bound to #' + AUDIO_ID);
   }
 
-  // The element is created once but the SPA re-renders; watch for it.
-  const mo = new MutationObserver(() => { if (mine()) bind(); });
-  mo.observe(document.documentElement, { childList: true, subtree: true });
-  bind();
-  if (!audioEl()) post('ready', { hasElement: false });
-  if (!rafId) loop();
+  // The tap now loads at document_start so the network observer sees Suno's
+  // bootstrap requests. The DOM may not exist yet, so install player observers
+  // separately as soon as documentElement becomes available.
+  function bootDom() {
+    if (st._domBooted || !document.documentElement) return;
+    st._domBooted = true;
+    const mo = new MutationObserver(() => { if (mine()) bind(); });
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+    st._mutationObserver = mo;
+    bind();
+    if (!audioEl()) post('ready', { hasElement: false });
+    if (!rafId) loop();
+  }
+  if (document.documentElement) bootDom();
+  else document.addEventListener('readystatechange', bootDom, { once: true });
 
   /* ------------------------------------------------------------------ *
    * control channel (isolated bridge relays SW -> page)                *
@@ -852,8 +1392,35 @@
         });
         break;
       }
+      /**
+       * The SW fetched the full clip record from Suno's API on our behalf.
+       * Update the live clip object so the next take — and the reflect tier —
+       * carry the title, tags, prompt, lyrics, model name, etc.
+       */
+      case 'clip-resolved': {
+        st._resolving = null;
+        const c = d.clip;
+        if (!c || c.id !== st.clipId) break;
+        st.clip = c;
+        dbg('clip resolved', c.id, c.title);
+        post('clip-change', { clipId: st.clipId, clip: minimalClip(c) });
+        // Once we have the clip, kick off a background fetch of structural
+        // analysis (sections, downbeats, lyrics) so the take has segments.
+        resolveStructure(st.clipId);
+        break;
+      }
+      case 'clip-structure': {
+        if (d.clipId !== st.clipId) break;
+        st.structure = d.structure;
+        dbg('clip structure resolved', d.clipId);
+        break;
+      }
     }
   });
 
-  post('installed', { version: '1.0.0' });
+  // Install before Suno's bundle makes its first API call. Idempotent
+  // across hot reloads (guarded by __genmusicassistNetHooked).
+  installNetworkObserver();
+
+  post('installed', { version: '1.0.5' });
 })();

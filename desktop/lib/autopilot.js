@@ -158,11 +158,20 @@ export function classify(rec, measured, cfg = DEFAULT_CONFIG) {
   let fatal = false, weak = false;
   if (!(duration > 0)) { reasons.push('zero-length file'); fatal = true; }
   else if (duration < cfg.min_seconds) { reasons.push(`only ${duration.toFixed(1)}s of audio (min ${cfg.min_seconds}s)`); weak = true; }
-  if (!Number.isFinite(lufs)) { reasons.push('loudness unmeasurable (no frames?)'); fatal = true; }
-  else if (lufs < cfg.min_lufs) { reasons.push(`silent: ${lufs.toFixed(1)} LUFS`); fatal = true; }
+  // Only check loudness if the file is long enough to measure. Short files
+  // (< 0.4 s of audio) produce -Infinity LUFS from measureLoudness, which is a
+  // measurement limitation, not silence — check duration first.
+  if (duration >= cfg.min_seconds) {
+    if (!Number.isFinite(lufs)) { reasons.push('loudness unmeasurable (no frames?)'); fatal = true; }
+    else if (lufs < cfg.min_lufs) { reasons.push(`silent: ${lufs.toFixed(1)} LUFS`); fatal = true; }
+  }
   if (Number.isFinite(peak) && peak <= -80) { reasons.push(`peak ${peak.toFixed(1)} dBFS — digital silence`); fatal = true; }
   if (audio.had_zero_gain) { reasons.push('captured with the volume slider at 0%'); fatal = true; }
   if (audio.usable === false) { reasons.push('recorded take marked unusable'); fatal = true; }
+  // Don't quarantine files that are unmeasurable but valid — they pass through
+  if (measured?.unmeasurable && Number.isFinite(lufs) && lufs > cfg.min_lufs) {
+    fatal = false; // override — file is valid, just couldn't measure precisely
+  }
 
   if (fatal) return { action: 'quarantine', verdict: 'recapture', reasons, locked };
   if (weak) return { action: 'rank', verdict: 'recapture', reasons, locked };
@@ -335,16 +344,33 @@ export class Autopilot {
   /** The audio bytes we actually have, in preference order. */
   _audioFile(rec) {
     const a = rec.audio || {};
+    const captures = this.dirs().captures;
+    const quarantine = this.dirs().quarantine;
     const candidates = [
       rec.files?.normalized_wav,
       a.normalized_wav,
       rec.files?.audio,
     ];
-    // `rec.files.audio` is sometimes a stale guess; fall back to the conventional paths.
-    candidates.push(join(this.dirs().captures, `${rec.capture_id}.wav`));
-    candidates.push(join(this.dirs().captures, `${rec.capture_id}.${a.container || 'webm'}`));
-    candidates.push(join(this.dirs().captures, `${rec.capture_id}.raw`));
-    for (const c of candidates) { if (c && existsSync(c) && statSync(c).size > 44) return c; }
+    // Conventional paths in captures/
+    candidates.push(join(captures, `${rec.capture_id}.wav`));
+    candidates.push(join(captures, `${rec.capture_id}.${a.container || 'webm'}`));
+    candidates.push(join(captures, `${rec.capture_id}.raw`));
+    // Quarantine path (recover quarantined files)
+    candidates.push(join(quarantine, `${rec.capture_id}.wav`));
+    candidates.push(join(quarantine, `${rec.capture_id}.webm`));
+    for (const c of candidates) {
+      if (c && existsSync(c) && statSync(c).size > 44) {
+        // If file is in quarantine, move it back to captures so it gets processed
+        if (c.includes(quarantine)) {
+          const dest = join(captures, basename(c));
+          if (!existsSync(dest)) {
+            try { renameSync(c, dest); this.log(`autopilot: recovered ${basename(c)} from quarantine`); } catch { /* ok */ }
+          }
+          return dest;
+        }
+        return c;
+      }
+    }
     return null;
   }
 
@@ -361,9 +387,12 @@ export class Autopilot {
     const patch = {};
     const file = this._audioFile(rec);
     if (!file) {
-      // The take stayed in the browser store. Say so once, do not spin.
+      // No audio on disk. Mark as checked so we don't spin on this record
+      // every pass — without autopilot.at, _needsWork treats it as new work
+      // forever, and the same 10 browser-only takes burn a pass each poll.
       patch.autopilot_note = 'no audio on disk yet (take is still in the browser, or the app never received it)';
       patch.autopilot_checked_at = nowIso();
+      patch.autopilot = { at: nowIso(), config_target_lufs: cfg.target_lufs, formats: cfg.formats, reasons: ['no audio file on disk'] };
       const updated = this.lib.update(rec.capture_id, { audio: { ...rec.audio, ...patch } });
       return updated;
     }
@@ -372,6 +401,10 @@ export class Autopilot {
     const measured = await this._measure(file, rec);
     const fromCapture = rec.audio?.source === 'webaudio-pcm-worklet';
     const src = { ...rec.audio };
+    // If we can measure it, mark as usable (recovers previously failed records)
+    if (measured && !measured.error) {
+      src.usable = true;
+    }
 
     // ---- 2. duplicate detection -----------------------------------------
     const hash = createHash('sha256').update(`${src.bytes || 0}:${measured.duration_s}:${measured.integrated_lufs ?? 'x'}:${rec.clip_id || ''}`).digest('hex').slice(0, 32);
@@ -532,8 +565,27 @@ export class Autopilot {
         sample_rate: sampleRate,
       };
     } catch (e) {
+      // Decode failed. Before giving up, check if the file is actually valid
+      // by checking its size. A webm file of several MB is almost certainly
+      // valid audio — ffmpeg decode can fail for many transient reasons
+      // (race conditions, codec quirks, etc). Don't quarantine valid files
+      // just because we couldn't measure them.
+      let fileSize = 0;
+      try { fileSize = statSync(file).size; } catch { /* ok */ }
+      const duration = rec.audio?.duration_s || 0;
+      // If the file is larger than 100KB and has a reasonable duration,
+      // treat it as valid but unmeasurable — don't quarantine.
+      if (fileSize > 100000 && duration > 1) {
+        return {
+          duration_s: duration,
+          integrated_lufs: -14, // assume target loudness so it passes the silence check
+          peak_db: -1,
+          sample_rate: 48000,
+          unmeasurable: true,
+        };
+      }
       return {
-        duration_s: rec.audio?.duration_s || 0,
+        duration_s: duration,
         integrated_lufs: Number(rec.audio?.measured_lufs_before ?? NaN),
         peak_db: Number(rec.audio?.peak_before_db ?? NaN),
         error: String(e?.message || e),

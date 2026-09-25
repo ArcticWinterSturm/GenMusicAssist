@@ -1,0 +1,15 @@
+# Runtime data — never commit
+captures/
+keeps/
+quarantine/
+session.json
+library.jsonl
+library.csv
+session-report.json
+recovery/
+*.webm
+*.wav
+*.m4a
+*.mp3
+node_modules/
+__pycache__/
